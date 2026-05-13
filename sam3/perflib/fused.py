@@ -18,8 +18,10 @@ def addmm_act(activation, linear, mat1):
     mat1_flat = mat1.view(-1, mat1.shape[-1])
     if activation in [torch.nn.functional.relu, torch.nn.ReLU]:
         y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=False)
+        y = y.to(torch.float32)
         return y.view(mat1.shape[:-1] + (y.shape[-1],))
     if activation in [torch.nn.functional.gelu, torch.nn.GELU]:
         y = addmm_act_op(self, mat1_flat, mat2.t(), beta=1, alpha=1, use_gelu=True)
+        y = y.to(torch.float32)
         return y.view(mat1.shape[:-1] + (y.shape[-1],))
     raise ValueError(f"Unexpected activation {activation}")

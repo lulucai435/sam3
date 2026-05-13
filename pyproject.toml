@@ -7,7 +7,7 @@ name = "sam3"
 dynamic = ["version"]
 description = "SAM3 (Segment Anything Model 3) implementation"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9,<3.13"
 license = {file = "LICENSE"}
 authors = [
     {name = "Meta AI Research"}
@@ -77,6 +77,12 @@ train = [
     "scikit-image",
     "scikit-learn",
 ]
+# Gemini + SAM3 pipeline: 图片 -> Gemini 识别物体 -> SAM3 分割
+gemini-sam3 = [
+    "google-genai",
+    "matplotlib",
+    "h5py",
+]
 
 [project.urls]
 "Homepage" = "https://github.com/facebookresearch/sam3"
@@ -133,3 +139,6 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
+
+[tool.uv]
+override-dependencies = [ "torch==2.4.1", "torchvision==0.19.1", "torchaudio==2.4.1"]
