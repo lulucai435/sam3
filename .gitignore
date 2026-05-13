@@ -151,3 +151,6 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+# Local env setup (may contain secrets — never commit)
+setupenvs.sh
