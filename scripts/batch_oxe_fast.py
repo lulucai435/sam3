@@ -264,14 +264,21 @@ def _run_sam3_batched_bf16(
                         {"label": name, "masks": None, "boxes": None, "scores": None}
                     )
                     continue
-                m_np = masks.detach().cpu().numpy().astype(bool)
+                # bf16 autocast 可能让 mask/score/box 仍是 bf16 tensor；numpy
+                # 不支持 bf16，需要先 .float() 提到 fp32 再转。
+                def _t2np(t):
+                    if t.is_floating_point():
+                        t = t.float()
+                    return t.detach().cpu().numpy()
+
+                m_np = _t2np(masks).astype(bool)
                 s_np = (
-                    scores.detach().cpu().numpy()
+                    _t2np(scores)
                     if scores is not None and len(scores) > 0
                     else None
                 )
                 b_np = (
-                    boxes.detach().cpu().numpy()
+                    _t2np(boxes)
                     if boxes is not None and len(boxes) > 0
                     else None
                 )
