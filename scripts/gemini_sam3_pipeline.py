@@ -164,6 +164,168 @@ def run_sam3_per_object(processor, image: Image.Image, object_names: list[str], 
     return results
 
 
+# ============================================================================
+# Batched SAM3 inference path (oxe_gemini_sam3_pipeline 用)
+# 用法对比：
+#   path A: run_sam3_per_object(processor, img, objects)
+#       逐 (image, object) 调用 set_image/set_text_prompt，简单但慢，VRAM 几 GB。
+#   path B: run_sam3_batched(model, transform, postprocessor, imgs, objects, B)
+#       一次 forward 处理 B 张图 × K 个 text query 共 B·K 个 detection 任务，
+#       backbone 不重复，吞吐 ~2-3×，VRAM 随 B 线性增长（B=16 约 70 GiB）。
+# 实现参考 examples/sam3_image_batched_inference.ipynb。
+# ============================================================================
+
+def build_batched_runtime(detection_threshold: float = 0.5):
+    """Return (transform, postprocessor) for run_sam3_batched. 一个 worker 构建一次即可。"""
+    from sam3.train.transforms.basic_for_api import (
+        ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI,
+    )
+    from sam3.eval.postprocessors import PostProcessImage
+
+    transform = ComposeAPI(
+        transforms=[
+            RandomResizeAPI(sizes=1008, max_size=1008, square=True, consistent_transform=False),
+            ToTensorAPI(),
+            NormalizeAPI(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+    postprocessor = PostProcessImage(
+        max_dets_per_img=-1,
+        iou_type="segm",
+        use_original_sizes_box=True,
+        use_original_sizes_mask=True,
+        convert_mask_to_rle=False,
+        detection_threshold=detection_threshold,
+        to_cpu=False,
+    )
+    return transform, postprocessor
+
+
+# Monotonic counter so every query in this process has a unique coco_image_id —
+# PostProcessImage.process_results returns a dict keyed by coco_image_id, so
+# duplicates would silently merge results from different (image, object) pairs.
+_BATCHED_QUERY_COUNTER = 0
+
+
+def _make_batched_datapoint(image: "Image.Image", object_names: list[str], transform):
+    """Build a Datapoint with one image and K text queries; return (datapoint, query_ids)."""
+    from sam3.train.data.sam3_image_dataset import (
+        InferenceMetadata, FindQueryLoaded, Image as SAMImage, Datapoint,
+    )
+    global _BATCHED_QUERY_COUNTER
+    dp = Datapoint(find_queries=[], images=[])
+    w, h = image.size
+    dp.images = [SAMImage(data=image, objects=[], size=[h, w])]
+    query_ids: list[int] = []
+    for obj in object_names:
+        _BATCHED_QUERY_COUNTER += 1
+        query_ids.append(_BATCHED_QUERY_COUNTER)
+        dp.find_queries.append(
+            FindQueryLoaded(
+                query_text=obj,
+                image_id=0,
+                object_ids_output=[],
+                is_exhaustive=True,
+                query_processing_order=0,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=_BATCHED_QUERY_COUNTER,
+                    original_image_id=_BATCHED_QUERY_COUNTER,
+                    original_category_id=1,
+                    # PostProcessImage feeds this to F.interpolate(target_size=...)
+                    # which wants (H, W). PIL .size is (W, H), so flip.
+                    original_size=[h, w],
+                    object_id=0,
+                    frame_index=0,
+                ),
+            )
+        )
+    return transform(dp), query_ids
+
+
+def run_sam3_batched(
+    model,
+    transform,
+    postprocessor,
+    images: list,
+    object_names: list[str],
+    batch_size: int = 16,
+) -> list[list[dict]]:
+    """同样的 K 个 object 在一组图上跑 batched SAM3。
+
+    输出格式与 run_sam3_per_object 一致（per-image list），便于复用
+    _merge_masks_per_label / _build_frame_arrays / _save_vis 等下游函数：
+        per_image[i] = [
+            {"label": object_names[k], "masks": (N,H,W) np.bool_ or None,
+             "boxes": (N,4) np.float32 or None, "scores": (N,) np.float32 or None}
+            for k in range(K)
+        ]
+    """
+    from sam3.train.data.collator import collate_fn_api as collate
+    from sam3.model.utils.misc import copy_data_to_device
+
+    if not images:
+        return []
+    if not object_names:
+        return [[] for _ in images]
+
+    out: list[list[dict]] = []
+    chunk_start = 0
+    cur_b = batch_size
+    while chunk_start < len(images):
+        chunk = images[chunk_start:chunk_start + cur_b]
+        dps = []
+        chunk_qids: list[list[int]] = []
+        for img in chunk:
+            dp, qids = _make_batched_datapoint(img, object_names, transform)
+            dps.append(dp)
+            chunk_qids.append(qids)
+
+        batch = collate(dps, dict_key="d")["d"]
+        batch = copy_data_to_device(batch, torch.device("cuda"), non_blocking=True)
+        try:
+            with torch.inference_mode():
+                output = model(batch)
+        except torch.cuda.OutOfMemoryError:
+            # 高 K（Gemini 给的 object 多）+ B 大时会爆显存。
+            # 砍半重试，最差降到 B=1 还不行就抛。
+            del batch, dps
+            torch.cuda.empty_cache()
+            if cur_b <= 1:
+                raise
+            cur_b = max(1, cur_b // 2)
+            print(f"[sam3] OOM at B={cur_b * 2} K={len(object_names)}; "
+                  f"retry with B={cur_b}", flush=True)
+            continue
+        processed = postprocessor.process_results(output, batch.find_metadatas)
+        # processed: dict[coco_image_id] -> {"scores","labels","boxes","masks"}
+
+        for qids in chunk_qids:
+            per_obj: list[dict] = []
+            for name, qid in zip(object_names, qids):
+                r = processed.get(qid)
+                if r is None:
+                    per_obj.append({"label": name, "masks": None, "boxes": None, "scores": None})
+                    continue
+                masks = r.get("masks")
+                scores = r.get("scores")
+                boxes = r.get("boxes")
+                if masks is None or len(masks) == 0:
+                    per_obj.append({"label": name, "masks": None, "boxes": None, "scores": None})
+                    continue
+                m_np = masks.detach().cpu().numpy().astype(bool)
+                s_np = (scores.detach().cpu().numpy()
+                        if scores is not None and len(scores) > 0 else None)
+                b_np = (boxes.detach().cpu().numpy()
+                        if boxes is not None and len(boxes) > 0 else None)
+                per_obj.append({"label": name, "masks": m_np, "boxes": b_np, "scores": s_np})
+            out.append(per_obj)
+        chunk_start += cur_b
+        # 成功了，尝试 ramp back 回原始 batch_size
+        if cur_b < batch_size:
+            cur_b = min(batch_size, cur_b * 2)
+    return out
+
+
 def _merge_masks_per_label(results: list) -> list:
     """同一 label 下的多个 instance mask 合并为一个（取并集），每个 label 对应一个 mask、一个 score（取最大）。"""
     merged = []

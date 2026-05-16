@@ -21,8 +21,8 @@ Output layout (same as single-shard script, one level deeper):
 Example:
   export GOOGLE_API_KEY=...
   python scripts/batch_oxe_full_dataset.py \\
-      --dataset-root /share/OpenXEmbodiment-Full \\
-      --output-root  /share/oxe_seg_out \\
+      --dataset-root ~/data/OpenXEmbodiment-Full \\
+      --output-root  ~/data/oxe_seg \\
       --gpus 0,1,2,3 --workers-per-gpu 2 \\
       --segment-mode sampled --num-gemini-frames 5
 """
@@ -36,6 +36,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -51,6 +52,28 @@ from PIL import Image
 
 
 _SHARD_RE = re.compile(r"^(?P<prefix>.+)\.tfrecord-(?P<idx>\d{5})-of-(?P<total>\d{5})$")
+
+
+def notify_serverchan(title: str, body: str, timeout: float = 10.0) -> bool:
+    """Push a message to WeChat via Server酱. Reads SCT_KEY from env.
+    Returns True if delivered, False otherwise. Never raises — notification
+    failure must not poison the caller."""
+    key = os.environ.get("SCT_KEY", "").strip()
+    if not key:
+        return False
+    try:
+        import urllib.parse
+        import urllib.request
+        url = f"https://sctapi.ftqq.com/{urllib.parse.quote(key)}.send"
+        data = urllib.parse.urlencode({"title": title, "desp": body}).encode("utf-8")
+        # The script runs with HTTPS_PROXY=clash already exported in SLURM, so
+        # urllib follows that env automatically.
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ok = 200 <= resp.status < 300
+        return ok
+    except Exception:  # noqa: BLE001
+        return False
 
 
 @dataclass(frozen=True)
@@ -193,6 +216,8 @@ def _build_episode_args(cli_args, cam_keys: list[str]) -> Namespace:
         segment_every_n=cli_args.segment_every_n,
         max_segment_frames=cli_args.max_segment_frames,
         save_vis=cli_args.save_vis,
+        batch_size=cli_args.batch_size,
+        max_objects=cli_args.max_objects,
     )
 
 
@@ -214,7 +239,7 @@ def _worker_main(
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from tfrecord.reader import tfrecord_loader
-        from gemini_sam3_pipeline import load_sam3_model
+        from gemini_sam3_pipeline import load_sam3_model, build_batched_runtime
         import oxe_gemini_sam3_pipeline as oxe_pipe
     except Exception as e:  # noqa: BLE001
         log(f"FATAL: import failed: {e}\n{traceback.format_exc()}")
@@ -223,18 +248,44 @@ def _worker_main(
     # Load SAM3 once per worker.
     try:
         log("loading SAM3 ...")
-        _, processor = load_sam3_model(
+        model, _ = load_sam3_model(
             device="cuda",
             confidence_threshold=cli_args.confidence,
             checkpoint_path=cli_args.checkpoint_path,
             load_from_hf=not cli_args.no_download_hf,
         )
-        log("SAM3 ready")
+        transform, postprocessor = build_batched_runtime(
+            detection_threshold=cli_args.confidence,
+        )
+        sam3_runtime = (model, transform, postprocessor)
+        log(f"SAM3 ready (batched path, batch_size={cli_args.batch_size})")
     except Exception as e:  # noqa: BLE001
         log(f"FATAL: SAM3 load failed: {e}\n{traceback.format_exc()}")
         return
 
     api_key = cli_args.gemini_api_key or os.environ.get("GOOGLE_API_KEY")
+    max_streak = int(getattr(cli_args, "gemini_max_consecutive_failures", 0) or 0)
+    gemini_fail_streak = 0  # consecutive Gemini-failed episodes seen by this worker
+
+    def trip_breaker(reason: str, shard_path: str = ""):
+        log(f"FATAL: {reason}; signaling parent to drain & stop all workers")
+        try:
+            os.kill(os.getppid(), signal.SIGTERM)
+        except Exception:  # noqa: BLE001
+            pass
+        # WeChat push via Server酱 (SCT_KEY env). Best-effort, silent on failure.
+        host = os.environ.get("HOSTNAME", "")
+        jobid = os.environ.get("SLURM_JOB_ID", "")
+        body = (
+            f"**SAM3 OXE pipeline tripped circuit breaker**\n\n"
+            f"- Worker: w{worker_id} on gpu={gpu_id}\n"
+            f"- Host: {host}\n"
+            f"- SLURM job: {jobid}\n"
+            f"- Reason: {reason}\n"
+            f"- Last shard: `{shard_path}`\n\n"
+            f"Action: check Gemini key / quota / clash proxy, then `sbatch` again."
+        )
+        notify_serverchan(title=f"⚠️ SAM3 熔断 job={jobid or '?'}", body=body)
 
     while True:
         try:
@@ -251,9 +302,35 @@ def _worker_main(
             log(f"[skip] {shard.path} (done)")
             continue
 
+        # Cross-job claim lock: prevents two concurrent jobs (e.g. an 8-GPU
+        # sbatch + a 1-GPU dev-container worker writing to the same output
+        # root) from picking the same shard. Stale claims (no mtime bump for
+        # claim_stale_secs) get stolen on the assumption the holder crashed.
+        claim_path = output_dir / "_CLAIMED"
+        claim_stale = int(getattr(cli_args, "claim_stale_secs", 7200) or 7200)
+        if claim_path.exists():
+            age = time.time() - claim_path.stat().st_mtime
+            if age < claim_stale:
+                log(f"[skip] {shard.path} (claimed elsewhere, age={age:.0f}s)")
+                continue
+            log(f"[steal] {shard.path} stale claim (age={age:.0f}s)")
+            claim_path.unlink(missing_ok=True)
+        try:
+            with open(claim_path, "x") as f:
+                f.write(
+                    f"job={os.environ.get('SLURM_JOB_ID', '?')} "
+                    f"host={socket.gethostname()} "
+                    f"pid={os.getpid()} "
+                    f"t={time.time():.0f}\n"
+                )
+        except FileExistsError:
+            log(f"[skip] {shard.path} (race lost to another worker)")
+            continue
+
         log(f"[start] {shard.path}")
         start_t = time.time()
-        n_eps = 0
+        n_ok = 0
+        n_fail = 0  # episodes that returned False (Gemini failure) or raised
         try:
             cam_keys_for_shard: list[str] | None = None
             if cli_args.cam_keys != "auto":
@@ -274,18 +351,49 @@ def _worker_main(
                 if ep_args is None:
                     ep_args = _build_episode_args(cli_args, cam_keys_for_shard)
 
+                # Keep claim fresh so long-running shards don't get stolen.
                 try:
-                    oxe_pipe.process_episode(
-                        ep_idx, example, processor, ep_args, api_key, output_dir,
+                    claim_path.touch()
+                except OSError:
+                    pass
+
+                try:
+                    ok = oxe_pipe.process_episode(
+                        ep_idx, example, sam3_runtime, ep_args, api_key, output_dir,
                     )
-                    n_eps += 1
+                    if ok:
+                        n_ok += 1
+                        gemini_fail_streak = 0
+                    else:
+                        n_fail += 1
+                        gemini_fail_streak += 1
                 except Exception as e:  # noqa: BLE001
+                    n_fail += 1
+                    gemini_fail_streak += 1
                     log(f"[err] ep {ep_idx} in {shard.path}: {e}\n{traceback.format_exc()}")
 
-            done_marker.write_text(f"episodes={n_eps}\nt={time.time():.0f}\n")
-            log(f"[done] {shard.path} episodes={n_eps} elapsed={time.time() - start_t:.1f}s")
+                if max_streak > 0 and gemini_fail_streak >= max_streak:
+                    trip_breaker(
+                        f"{gemini_fail_streak} consecutive Gemini failures "
+                        f"(threshold={max_streak}); current shard finishes its "
+                        f"loop then this worker exits",
+                        shard_path=shard.path,
+                    )
+                    break  # bail out of episode loop in this shard
+
+            if n_fail == 0:
+                done_marker.write_text(f"episodes={n_ok}\nt={time.time():.0f}\n")
+                log(f"[done] {shard.path} episodes={n_ok} elapsed={time.time() - start_t:.1f}s")
+            else:
+                log(f"[partial] {shard.path} ok={n_ok} fail={n_fail} "
+                    f"-> _DONE NOT written, retry next run "
+                    f"(elapsed={time.time() - start_t:.1f}s)")
         except Exception as e:  # noqa: BLE001
             log(f"[err] shard {shard.path}: {e}\n{traceback.format_exc()}")
+        finally:
+            # Always release the claim, otherwise the next sbatch would have to
+            # wait claim_stale_secs to steal it.
+            claim_path.unlink(missing_ok=True)
 
     log("exit")
 
@@ -306,7 +414,8 @@ def main():
         description="Multi-GPU driver over the full OpenX-Embodiment dataset. "
                     "Reuses process_episode() from oxe_gemini_sam3_pipeline.py.",
     )
-    ap.add_argument("--dataset-root", type=Path, default=Path("/share/OpenXEmbodiment-Full"))
+    ap.add_argument("--dataset-root", type=Path,
+                    default=Path("/public/home/lulucai/tensorflow_datasets"))
     ap.add_argument("--output-root", type=Path, required=True)
     ap.add_argument("--datasets", type=str, default=None,
                     help="Comma-separated dataset directory names to include (default: all)")
@@ -333,8 +442,10 @@ def main():
     ap.add_argument("--gemini-api-key", default=None)
 
     ap.add_argument("--confidence", type=float, default=0.5)
-    ap.add_argument("--checkpoint-path", type=str,
-                    default="/data/lulucai/code/sam3/weights/sam3.pt")
+    ap.add_argument("--checkpoint-path", type=str, default=None,
+                    help="Local SAM3 checkpoint .pt; otherwise resolved via the "
+                         "HuggingFace cache (models--facebook--sam3) unless "
+                         "--no-download-hf is also passed")
     ap.add_argument("--no-download-hf", action="store_true")
 
     ap.add_argument("--segment-mode", choices=("all", "sampled", "every_n"), default="all")
@@ -342,11 +453,26 @@ def main():
                     help="Frame stride for --segment-mode every_n (default: 10)")
     ap.add_argument("--max-segment-frames", type=int, default=None)
     ap.add_argument("--save-vis", action="store_true")
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="SAM3 batched-forward image batch size per worker. "
+                         "Roughly +4.5 GiB VRAM per image at 1008x1008 resolution. "
+                         "B=16 ≈ 70 GiB (half of an H200).")
+    ap.add_argument("--max-objects", type=int, default=10,
+                    help="Cap K (objects per episode). K>~10 forces SAM3 batched path to "
+                         "downgrade to B=4 (OOM), which is ~4x slower. 0 disables the cap.")
+    ap.add_argument("--gemini-max-consecutive-failures", type=int, default=5,
+                    help="Abort the job after this many consecutive Gemini-failed "
+                         "episodes in a single worker. Usually means key revoked, "
+                         "quota hit, or proxy down — better to stop early than burn "
+                         "through thousands of shards. 0 disables the circuit breaker.")
 
     ap.add_argument("--skip-gemini", action="store_true")
     ap.add_argument("--objects", type=str, default=None)
 
     ap.add_argument("--force", action="store_true", help="Re-process shards with an existing _DONE marker")
+    ap.add_argument("--claim-stale-secs", type=int, default=7200,
+                    help="A shard's _CLAIMED file is considered stale (and can be stolen) "
+                         "after this many seconds with no mtime bump. Default 7200 (2h).")
     ap.add_argument("--list-only", action="store_true", help="Discover shards and exit")
 
     args = ap.parse_args()

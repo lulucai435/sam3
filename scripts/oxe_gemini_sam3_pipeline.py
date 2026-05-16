@@ -51,6 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gemini_sam3_pipeline import (  # noqa: E402
     load_sam3_model,
     run_sam3_per_object,
+    run_sam3_batched,
+    build_batched_runtime,
     _merge_masks_per_label,
 )
 
@@ -177,13 +179,28 @@ def gemini_objects_for_episode(
         raise ValueError("Set GOOGLE_API_KEY or pass --gemini-api-key")
 
     prompt = (
-        "Identify unique objects in these frames.\n"
-        f'Task: "{instruction}"\n'
+        "Enumerate EVERY distinct physical object visible across these frames "
+        "(scene inventory, not just task-relevant ones).\n"
+        f'Task context: "{instruction}"\n'
         "Requirements:\n"
-        '- Include objects from Task, "robotic arm", and environment.\n'
-        '- 1-3 words per name (e.g., "silver fork", "red block").\n'
-        "- Output ONLY a JSON array of strings.\n"
-        'Example: ["robotic arm", "green apple", "metal tray"]'
+        "- List ALL distinct visible objects: distractor items, containers, tools.\n"
+        '- Include the robot as a SINGLE entry "robotic arm". Do NOT add separate '
+        '  entries for its parts ("robot gripper", "robot base", "robot wrist") '
+        '  — the arm entry covers the whole manipulator.\n'
+        "- Also include the main support surface (e.g. \"table\", \"tray\") "
+        "  and any large fixed elements visible (e.g. \"wall\", \"shelf\").\n"
+        "- Each name 1-3 words, descriptive but generic enough that SAM3 "
+        '  can ground it (e.g. "red can", "green bottle", "lavender container").\n'
+        "- Disambiguate by color/shape when multiple similar objects are present.\n"
+        "- One entry per unique object instance class. No duplicates, no parts "
+        '  ("can lid"), no actions, no abstract nouns.\n'
+        "- Only list objects you can ACTUALLY see in the frames. Do not include "
+        "  generic items (\"green bottle\", \"white table\") unless they are "
+        "  truly present and match the stated color.\n"
+        "- Aim for ~5-15 entries. Output ONLY a JSON array of strings, "
+        "  no commentary.\n"
+        'Example: ["robotic arm", "red soda can", "green bottle", '
+        '"orange snack bag", "purple container", "white table"]'
     )
 
     if _GEMINI_BACKEND == "google-genai":
@@ -234,15 +251,36 @@ def _build_frame_arrays(merged_results, object_names, h, w):
     return masks, scores
 
 
-def _save_vis(image: Image.Image, merged_results, object_names, out_path: Path):
+def _save_vis(
+    image: Image.Image,
+    merged_results,
+    object_names,
+    out_path: Path,
+    gemini_image_size: int = 512,
+):
+    """Side-by-side panel: [Gemini input (resized) | SAM3 mask overlay (full res)].
+
+    Left panel mimics what Gemini actually received (after _resize_for_gemini).
+    Right panel shows the same frame with SAM3 masks overlaid, label list in corner.
+    """
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         return
-    arr = np.array(image.convert("RGB")) / 255.0
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(arr)
+
+    gemini_view = _resize_for_gemini(image, gemini_image_size)
+    arr_gemini = np.array(gemini_view.convert("RGB")) / 255.0
+    arr_full = np.array(image.convert("RGB")) / 255.0
+
+    fig, (ax_in, ax_out) = plt.subplots(1, 2, figsize=(16, 7))
+    ax_in.imshow(arr_gemini)
+    ax_in.set_title(f"Gemini input  ({gemini_view.size[0]}×{gemini_view.size[1]})", fontsize=11)
+    ax_in.axis("off")
+
+    ax_out.imshow(arr_full)
+    ax_out.set_title(f"SAM3 masks  ({image.size[0]}×{image.size[1]})", fontsize=11)
     colors = plt.cm.tab20(np.linspace(0, 1, max(len(object_names), 1)))
+    n_drawn = 0
     for r in merged_results:
         if r["masks"] is None:
             continue
@@ -257,13 +295,22 @@ def _save_vis(image: Image.Image, merged_results, object_names, out_path: Path):
         overlay = np.zeros((*m.shape, 4))
         overlay[..., :3] = color
         overlay[..., 3] = 0.4 * m
-        ax.imshow(overlay)
-        ax.text(0.02, 0.98 - i * 0.025, r["label"],
-                transform=ax.transAxes, color=color, fontsize=9,
-                verticalalignment="top")
-    ax.axis("off")
+        ax_out.imshow(overlay)
+        score = ""
+        if r.get("scores") is not None:
+            try:
+                score = f"  ({float(np.asarray(r['scores']).max()):.2f})"
+            except Exception:  # noqa: BLE001
+                score = ""
+        ax_out.text(0.02, 0.98 - n_drawn * 0.04, f"{r['label']}{score}",
+                    transform=ax_out.transAxes, color=color, fontsize=9,
+                    verticalalignment="top",
+                    bbox=dict(facecolor="black", alpha=0.45, pad=1.5, edgecolor="none"))
+        n_drawn += 1
+    ax_out.axis("off")
+
     plt.tight_layout()
-    plt.savefig(out_path, bbox_inches="tight", dpi=120)
+    plt.savefig(out_path, bbox_inches="tight", dpi=110)
     plt.close()
 
 
@@ -271,11 +318,30 @@ def _save_vis(image: Image.Image, merged_results, object_names, out_path: Path):
 def process_episode(
     episode_idx: int,
     example: dict,
-    processor,
+    sam3_runtime,
     args,
     api_key: str | None,
     output_dir: Path,
-):
+) -> bool:
+    """sam3_runtime: 3-tuple (model, transform, postprocessor) for batched path,
+    or a Sam3Processor for the legacy per-object path. The batched path is selected
+    automatically when a 3-tuple is given.
+
+    Returns:
+      True  -- episode finished cleanly OR was a structural skip (no camera /
+              no decodable frames) that won't change on retry.
+      False -- episode is INCOMPLETE due to a transient failure (Gemini call
+              raised); caller must not mark its shard _DONE so the next run
+              can pick it up.
+    """
+    use_batched = isinstance(sam3_runtime, tuple) and len(sam3_runtime) == 3
+    if use_batched:
+        sam3_model, sam3_transform, sam3_postproc = sam3_runtime
+        sam3_processor = None
+    else:
+        sam3_model = sam3_transform = sam3_postproc = None
+        sam3_processor = sam3_runtime
+    batch_size = int(getattr(args, "batch_size", 16) or 16)
     instruction = _episode_instruction(example)
 
     cam_frames: dict[str, list[Image.Image | None]] = {}
@@ -286,7 +352,7 @@ def process_episode(
 
     if not cam_frames:
         print(f"  episode {episode_idx}: no camera frames in {args.cam_keys}, skip")
-        return
+        return True
 
     primary_cam = args.cam_keys[0].split("/")[-1]
     if primary_cam not in cam_frames:
@@ -296,7 +362,7 @@ def process_episode(
     valid_primary = [(i, f) for i, f in enumerate(primary_seq) if f is not None]
     if not valid_primary:
         print(f"  episode {episode_idx}: primary cam '{primary_cam}' has no decodable frames, skip")
-        return
+        return True
 
     sample_pos = _sample_indices(len(valid_primary), args.num_gemini_frames)
     sampled = [valid_primary[p] for p in sample_pos]
@@ -330,10 +396,18 @@ def process_episode(
                 # instead of treating it as already processed.
                 print(f"  episode {episode_idx}: Gemini call failed: {e} "
                       f"-> no metadata.json written, will retry on next run")
-                return
+                return False
             print(f"  episode {episode_idx}: instruction='{instruction}'")
             print(f"  episode {episode_idx}: objects={objects}")
 
+    # 截断 K：K>~10 时 SAM3 batched path 会 OOM 降到 B=4，速度退化 ~4x。
+    max_obj = int(getattr(args, "max_objects", 0) or 0)
+    if max_obj > 0 and len(objects) > max_obj:
+        dropped = objects[max_obj:]
+        objects = objects[:max_obj]
+        print(f"  episode {episode_idx}: K cap {max_obj} -> kept={objects}, dropped={dropped}")
+
+    if not meta_path.exists():
         meta = {
             "episode_index": episode_idx,
             "language_instruction": instruction,
@@ -349,7 +423,7 @@ def process_episode(
 
     if not objects:
         print(f"  episode {episode_idx}: no objects, skipping SAM3")
-        return
+        return True
 
     for cam, seq in cam_frames.items():
         cam_dir = episode_dir / cam
@@ -374,6 +448,9 @@ def process_episode(
 
         vis_set = set(sampled_indices) if (args.save_vis and cam == primary_cam) else set()
 
+        # Collect (t, img, need_sam3, need_vis) for everything that still needs work.
+        # Batched path then runs SAM3 once per chunk; legacy path runs once per frame.
+        to_do: list[tuple[int, Image.Image, bool, bool]] = []
         for t in indices:
             img = seq[t] if 0 <= t < len(seq) else None
             if img is None:
@@ -384,18 +461,38 @@ def process_episode(
             need_vis = t in vis_set and not vis_path.exists()
             if not need_sam3 and not need_vis:
                 continue
-            results = run_sam3_per_object(processor, img, objects)
+            to_do.append((t, img, need_sam3, need_vis))
+
+        if not to_do:
+            continue
+
+        if use_batched:
+            imgs_to_run = [item[1] for item in to_do]
+            per_image_results = run_sam3_batched(
+                sam3_model, sam3_transform, sam3_postproc,
+                imgs_to_run, objects, batch_size=batch_size,
+            )
+        else:
+            per_image_results = [
+                run_sam3_per_object(sam3_processor, item[1], objects) for item in to_do
+            ]
+
+        for (t, img, need_sam3, need_vis), results in zip(to_do, per_image_results):
             merged = _merge_masks_per_label(results)
             if need_sam3:
                 w, h = img.size
+                npz_path = cam_dir / f"{t:06d}.npz"
                 masks, scores = _build_frame_arrays(merged, objects, h, w)
                 np.savez_compressed(npz_path, masks=masks, scores=scores)
             if need_vis:
-                _save_vis(img, merged, objects, vis_path)
+                vis_path = cam_dir / f"vis_{t:06d}.png"
+                _save_vis(img, merged, objects, vis_path,
+                          gemini_image_size=getattr(args, "gemini_image_size", 512))
 
     total_frames = sum(len(seq) for seq in cam_frames.values())
     print(f"  episode {episode_idx}: done ({len(objects)} objects, "
           f"{total_frames} total frames across {len(cam_frames)} cameras)")
+    return True
 
 
 # --- Main --------------------------------------------------------------------
@@ -441,6 +538,11 @@ def main():
                     help="Skip Gemini and use --objects directly (debug)")
     ap.add_argument("--objects", type=str, default=None,
                     help="Comma-separated object list when --skip-gemini")
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="SAM3 batched-forward image batch size (queries/forward = B * len(objects))")
+    ap.add_argument("--max-objects", type=int, default=10,
+                    help="Cap K (objects per episode). K>~10 forces SAM3 batched path to "
+                         "downgrade to B=4 (OOM), which is ~4x slower. 0 disables the cap.")
 
     args = ap.parse_args()
     args.cam_keys = [k.strip() for k in args.cam_keys.split(",") if k.strip()]
@@ -456,12 +558,14 @@ def main():
         raise ValueError("--no-download-hf requires --checkpoint-path")
 
     print("Loading SAM3...")
-    _, processor = load_sam3_model(
+    model, _ = load_sam3_model(
         device=args.device,
         confidence_threshold=args.confidence,
         checkpoint_path=args.checkpoint_path,
         load_from_hf=load_from_hf,
     )
+    transform, postprocessor = build_batched_runtime(detection_threshold=args.confidence)
+    sam3_runtime = (model, transform, postprocessor)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Reading TFRecord: {args.tfrecord}")
@@ -469,7 +573,7 @@ def main():
     for ep_idx, example in enumerate(tfrecord_loader(str(args.tfrecord), None, None)):
         if args.max_episodes is not None and ep_idx >= args.max_episodes:
             break
-        process_episode(ep_idx, example, processor, args, api_key, args.output_dir)
+        process_episode(ep_idx, example, sam3_runtime, args, api_key, args.output_dir)
 
     print(f"All done. Output -> {args.output_dir}")
 

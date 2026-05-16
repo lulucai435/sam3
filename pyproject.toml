@@ -7,7 +7,7 @@ name = "sam3"
 dynamic = ["version"]
 description = "SAM3 (Segment Anything Model 3) implementation"
 readme = "README.md"
-requires-python = ">=3.9,<3.13"
+requires-python = ">=3.12"
 license = {file = "LICENSE"}
 authors = [
     {name = "Meta AI Research"}
@@ -82,6 +82,13 @@ gemini-sam3 = [
     "google-genai",
     "matplotlib",
     "h5py",
+    "tfrecord",
+    "einops",           # sam3.sam.rope imports einops directly
+    "setuptools<81",    # sam3.model_builder imports pkg_resources, removed in setuptools 81+
+    "pycocotools",      # eagerly imported via sam3.__init__ -> train.data.collator
+    "psutil",           # eagerly imported via sam3.model.sam3_video_predictor
+    "decord",           # video decoding fallback
+    "crc32c",           # tfrecord CRC verification (parses real TFRecord shards)
 ]
 
 [project.urls]
@@ -141,4 +148,17 @@ python_classes = "Test*"
 python_functions = "test_*"
 
 [tool.uv]
-override-dependencies = [ "torch==2.4.1", "torchvision==0.19.1", "torchaudio==2.4.1"]
+# Align with README.md: PyTorch 2.10 + CUDA 12.8 wheels.
+override-dependencies = [
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
