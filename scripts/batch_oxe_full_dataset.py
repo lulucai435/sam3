@@ -51,7 +51,9 @@ from pathlib import Path
 from PIL import Image
 
 
-_SHARD_RE = re.compile(r"^(?P<prefix>.+)\.tfrecord-(?P<idx>\d{5})-of-(?P<total>\d{5})$")
+_SHARD_RE = re.compile(
+    r"^(?P<prefix>.+)\.tfrecord-(?P<idx>\d{5})(?:-of-(?P<total>\d{5}))?$"
+)
 
 
 def notify_serverchan(title: str, body: str, timeout: float = 10.0) -> bool:
@@ -128,6 +130,8 @@ def discover_shards(
             except OSError:
                 continue
             shards_here: list[ShardTask] = []
+            parsed: list[tuple[re.Match[str], Path]] = []
+            no_total_counts: dict[str, int] = {}
             for name in entries:
                 m = _SHARD_RE.match(name)
                 if not m:
@@ -135,11 +139,21 @@ def discover_shards(
                 p = ver_dir / name
                 if not p.is_file():
                     continue
+                parsed.append((m, p))
+                if m.group("total") is None:
+                    prefix = m.group("prefix")
+                    no_total_counts[prefix] = no_total_counts.get(prefix, 0) + 1
+            for m, p in parsed:
+                total = m.group("total")
+                if total is None:
+                    # language_table 这类老 TFDS 命名没有 `-of-MMMMM`，按本目录
+                    # 内同 prefix 的 shard 数回填，保持 ShardTask.total 始终五位数字。
+                    total = f"{no_total_counts[m.group('prefix')]:05d}"
                 shards_here.append(ShardTask(
                     dataset=ds_name,
                     version=ver_dir.name,
                     prefix=m.group("prefix"),
-                    total=m.group("total"),
+                    total=total,
                     path=str(p),
                 ))
             if shards_here:
