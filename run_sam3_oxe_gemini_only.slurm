@@ -3,15 +3,14 @@
 #SBATCH --chdir=/public/home/lulucai/code/sam3
 #SBATCH --output=/public/home/lulucai/code/sam3/logs/sam3_oxe_gemini_%j.out
 #SBATCH --error=/public/home/lulucai/code/sam3/logs/sam3_oxe_gemini_%j.err
-#SBATCH --partition=gpu
-#SBATCH --gres=gpu:8
+#SBATCH --partition=cpu
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --time=48:00:00
-#SBATCH --mem=120G
+#SBATCH --mem=32G
 
 # Stage 1：只跑 Gemini，写 metadata.json + _GEMINI_DONE，不加载 SAM3。
-# 不占 GPU VRAM，workers 可以开多一倍（4/gpu=32总），纯网络IO。
+# CPU 节点即可，不占 GPU 资源。纯网络 IO，workers 可多开。
 # 用法（mgmt 节点）：
 #   sbatch run_sam3_oxe_gemini_only.slurm
 
@@ -73,10 +72,12 @@ echo "Python: $PY ($($PY --version))"
 echo "Hostname: $(hostname)"
 echo "============"
 
-NUM_GPUS=$($PY -c 'import torch; print(torch.cuda.device_count())')
-GPU_IDS=$($PY -c "print(','.join(str(i) for i in range($NUM_GPUS)))")
-echo "Using GPU ids: ${GPU_IDS} (1 worker/gpu=$(echo $GPU_IDS | tr ',' '\n' | wc -l) total, gemini-only, no SAM3)"
-echo "Gemini 并发数 = GPU数×1×lookahead=2，避免 clash 过载"
+# CPU 节点：用假 GPU ID "0" × N_WORKERS，workers-per-gpu=1 → N_WORKERS 个进程
+# gemini-only 不加载 SAM3，CUDA_VISIBLE_DEVICES 被设置但不使用
+N_WORKERS=8
+GPU_IDS=$($PY -c "print(','.join(['0']*$N_WORKERS))")
+echo "CPU mode: ${N_WORKERS} Gemini workers (no GPU, gemini-only)"
+echo "Gemini 并发数 = ${N_WORKERS} workers × lookahead=2 = $((N_WORKERS*2)) 连接"
 
 $PY scripts/batch_oxe_fast.py \
   --dataset-root /public/home/lisunhku/tensorflow_datasets \
