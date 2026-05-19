@@ -42,7 +42,7 @@ echo "============"
 
 NUM_GPUS=$($PY -c 'import torch; print(torch.cuda.device_count())')
 GPU_IDS=$($PY -c "print(','.join(str(i) for i in range($NUM_GPUS)))")
-echo "Using GPU ids: ${GPU_IDS} (2 workers/gpu=16 total, sam3-only, no Gemini)"
+echo "Using GPU ids: ${GPU_IDS} (2 workers/gpu=16 total, sam3-only-live, polling every 120s)"
 
 $PY scripts/batch_oxe_fast.py \
   --dataset-root /public/home/lisunhku/tensorflow_datasets \
@@ -57,6 +57,7 @@ $PY scripts/batch_oxe_fast.py \
   --confidence 0.5 \
   --save-vis \
   --sam3-only \
+  --poll-interval 120 \
   --datasets fractal20220817_data,kuka,bridge,taco_play,jaco_play,berkeley_cable_routing,roboturk,viola,berkeley_autolab_ur5,toto,language_table,stanford_hydra_dataset_converted_externally_to_rlds,austin_buds_dataset_converted_externally_to_rlds,nyu_franka_play_dataset_converted_externally_to_rlds,furniture_bench_dataset_converted_externally_to_rlds,ucsd_kitchen_dataset_converted_externally_to_rlds,austin_sailor_dataset_converted_externally_to_rlds,austin_sirius_dataset_converted_externally_to_rlds,dlr_edan_shared_control_converted_externally_to_rlds,iamlab_cmu_pickup_insert_converted_externally_to_rlds,utaustin_mutex,berkeley_fanuc_manipulation,cmu_stretch,bc_z,fmb,dobbe,droid
 
 echo "SAM3 stage done -> /public/home/lulucai/data/oxe_seg"

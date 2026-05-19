@@ -75,13 +75,14 @@ echo "============"
 
 NUM_GPUS=$($PY -c 'import torch; print(torch.cuda.device_count())')
 GPU_IDS=$($PY -c "print(','.join(str(i) for i in range($NUM_GPUS)))")
-echo "Using GPU ids: ${GPU_IDS} (4 workers/gpu=32 total, gemini-only, no SAM3)"
+echo "Using GPU ids: ${GPU_IDS} (1 worker/gpu=$(echo $GPU_IDS | tr ',' '\n' | wc -l) total, gemini-only, no SAM3)"
+echo "Gemini 并发数 = GPU数×1×lookahead=2，避免 clash 过载"
 
 $PY scripts/batch_oxe_fast.py \
   --dataset-root /public/home/lisunhku/tensorflow_datasets \
   --output-root  /public/home/lulucai/data/oxe_seg \
   --gpus "${GPU_IDS}" \
-  --workers-per-gpu 4 \
+  --workers-per-gpu 1 \
   --gemini-lookahead 2 \
   --num-gemini-frames 5 \
   --gemini-model gemini-2.5-flash-lite \

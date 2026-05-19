@@ -909,6 +909,15 @@ def main():
         "--sam3-only", action="store_true",
         help="只跑 SAM3，读已有 metadata.json，不调 Gemini。需先跑 --gemini-only。",
     )
+    ap.add_argument(
+        "--poll-interval", type=int, default=0,
+        help=(
+            "sam3-only 模式下队列耗尽后轮询新 _GEMINI_DONE shard 的间隔（秒）。"
+            "0=不轮询（跑完就退出）。>0=持续等待，直到 "
+            "output_root/_ALL_GEMINI_DONE 出现且队列空才退出。"
+            "用于与 gemini-only job 并行运行。"
+        ),
+    )
 
     args = ap.parse_args()
     if args.gemini_only and args.sam3_only:
@@ -958,14 +967,30 @@ def main():
 
     args.output_root.mkdir(parents=True, exist_ok=True)
 
+    # sam3-only + poll-interval: 持续轮询新 _GEMINI_DONE shard，与 gemini-only
+    # job 并行运行。初始 shards 里过滤掉还没有 _GEMINI_DONE 的（等下轮再捡）。
+    poll_interval = int(getattr(args, "poll_interval", 0) or 0)
+    sam3_only_live = args.sam3_only and poll_interval > 0
+    if sam3_only_live:
+        shards = [
+            s for s in shards
+            if (args.output_root / s.rel_out / "_GEMINI_DONE").exists()
+            and not (args.output_root / s.rel_out / "_DONE").exists()
+        ]
+        print(f"[live] initial eligible shards: {len(shards)}")
+
     ctx = mp.get_context("spawn")
     task_q = ctx.Queue()
     log_q = ctx.Queue()
+    queued_paths: set[str] = set()
     for s in shards:
         task_q.put(s)
+        queued_paths.add(s.path)
     num_workers = len(gpu_ids) * args.workers_per_gpu
-    for _ in range(num_workers):
-        task_q.put(None)
+    if not sam3_only_live:
+        # 普通模式：提前放 None sentinel，workers 跑完就退出
+        for _ in range(num_workers):
+            task_q.put(None)
 
     stop_evt = threading.Event()
     log_t = threading.Thread(
@@ -984,6 +1009,13 @@ def main():
             procs.append(p)
             wid += 1
 
+    def _send_stop():
+        for _ in range(num_workers):
+            try:
+                task_q.put_nowait(None)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _graceful(signum, frame):  # noqa: ARG001
         print(
             "\n[parent] Ctrl-C: draining remaining shards; in-flight will finish.",
@@ -994,20 +1026,51 @@ def main():
                 task_q.get_nowait()
         except queue.Empty:
             pass
-        for _ in range(num_workers):
-            try:
-                task_q.put_nowait(None)
-            except Exception:  # noqa: BLE001
-                pass
+        _send_stop()
 
     signal.signal(signal.SIGINT, _graceful)
     signal.signal(signal.SIGTERM, _graceful)
+
+    if sam3_only_live:
+        # 轮询主循环：每 poll_interval 秒检查新 _GEMINI_DONE shard
+        sentinel = args.output_root / "_ALL_GEMINI_DONE"
+        all_shards_src = discover_shards(
+            root=args.dataset_root,
+            datasets=ds_filter,
+            version_policy=args.version_policy,
+            shard_group_policy=args.shard_group_policy,
+        )
+        while True:
+            time.sleep(poll_interval)
+            new = [
+                s for s in all_shards_src
+                if s.path not in queued_paths
+                and (args.output_root / s.rel_out / "_GEMINI_DONE").exists()
+                and not (args.output_root / s.rel_out / "_DONE").exists()
+            ]
+            for s in new:
+                task_q.put(s)
+                queued_paths.add(s.path)
+            if new:
+                print(f"[live] queued {len(new)} new shards (total queued: {len(queued_paths)})", flush=True)
+            # 退出条件：sentinel 存在且没有新 shard
+            if sentinel.exists() and not new:
+                print("[live] _ALL_GEMINI_DONE seen + no new shards → stopping workers", flush=True)
+                _send_stop()
+                break
 
     for p in procs:
         p.join()
 
     stop_evt.set()
     log_t.join(timeout=5)
+
+    # gemini-only 完成后写 sentinel，通知 sam3-only-live workers 退出
+    if getattr(args, "gemini_only", False):
+        sentinel = args.output_root / "_ALL_GEMINI_DONE"
+        sentinel.write_text(f"t={time.time():.0f}\n")
+        print(f"[gemini-only] sentinel written: {sentinel}")
+
     print(f"All done. Output -> {args.output_root}")
 
 
