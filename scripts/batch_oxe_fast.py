@@ -448,34 +448,41 @@ def _worker_main(
         log(f"FATAL: import failed: {e}\n{traceback.format_exc()}")
         return
 
-    try:
-        log("loading SAM3 ...")
-        model, _ = load_sam3_model(
-            device="cuda",
-            confidence_threshold=cli_args.confidence,
-            checkpoint_path=cli_args.checkpoint_path,
-            load_from_hf=not cli_args.no_download_hf,
-        )
-        transform, postprocessor = build_batched_runtime(
-            detection_threshold=cli_args.confidence
-        )
-        sam3_runtime = (model, transform, postprocessor)
-        log(
-            f"SAM3 ready (bf16 autocast, B={cli_args.batch_size}, "
-            f"gemini_lookahead={cli_args.gemini_lookahead})"
-        )
-    except Exception as e:  # noqa: BLE001
-        log(f"FATAL: SAM3 load failed: {e}\n{traceback.format_exc()}")
-        return
+    if getattr(cli_args, "gemini_only", False):
+        sam3_runtime = None
+        log("gemini-only mode: skipping SAM3 load")
+    else:
+        try:
+            log("loading SAM3 ...")
+            model, _ = load_sam3_model(
+                device="cuda",
+                confidence_threshold=cli_args.confidence,
+                checkpoint_path=cli_args.checkpoint_path,
+                load_from_hf=not cli_args.no_download_hf,
+            )
+            transform, postprocessor = build_batched_runtime(
+                detection_threshold=cli_args.confidence
+            )
+            sam3_runtime = (model, transform, postprocessor)
+            log(
+                f"SAM3 ready (bf16 autocast, B={cli_args.batch_size}, "
+                f"gemini_lookahead={cli_args.gemini_lookahead})"
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"FATAL: SAM3 load failed: {e}\n{traceback.format_exc()}")
+            return
 
     api_key = cli_args.gemini_api_key or os.environ.get("GOOGLE_API_KEY")
     max_streak = int(getattr(cli_args, "gemini_max_consecutive_failures", 0) or 0)
     gemini_fail_streak = 0
 
-    gemini_pool = ThreadPoolExecutor(
-        max_workers=cli_args.gemini_lookahead,
-        thread_name_prefix=f"w{worker_id}-gemini",
-    )
+    if getattr(cli_args, "sam3_only", False):
+        gemini_pool = None
+    else:
+        gemini_pool = ThreadPoolExecutor(
+            max_workers=cli_args.gemini_lookahead,
+            thread_name_prefix=f"w{worker_id}-gemini",
+        )
 
     def gemini_submit(prepared: _PreparedEpisode) -> Future:
         return gemini_pool.submit(
@@ -517,9 +524,18 @@ def _worker_main(
         output_dir = Path(cli_args.output_root) / shard.rel_out
         output_dir.mkdir(parents=True, exist_ok=True)
         done_marker = output_dir / "_DONE"
+        gemini_done_marker = output_dir / "_GEMINI_DONE"
         if done_marker.exists() and not cli_args.force:
             log(f"[skip] {shard.path} (done)")
             continue
+        if getattr(cli_args, "gemini_only", False):
+            if gemini_done_marker.exists() and not cli_args.force:
+                log(f"[skip] {shard.path} (gemini done)")
+                continue
+        elif getattr(cli_args, "sam3_only", False):
+            if not gemini_done_marker.exists():
+                log(f"[skip] {shard.path} (gemini not done yet)")
+                continue
 
         # Per-shard claim lock (parity with batch_oxe_full_dataset.py).
         claim_path = output_dir / "_CLAIMED"
@@ -611,6 +627,13 @@ def _worker_main(
                         return True
                     except Exception:
                         pass  # fall through and call Gemini
+                if getattr(cli_args, "sam3_only", False):
+                    # No metadata.json in SAM3-only mode → skip episode.
+                    buffered.append((_PreparedEpisode(
+                        ep_idx=ep_idx, instruction="", cam_frames={},
+                        primary_cam="", sampled_indices=[], sampled_imgs=[],
+                    ), None))
+                    return True
                 if cli_args.skip_gemini:
                     prepared.objects = [
                         s.strip()
@@ -714,6 +737,11 @@ def _worker_main(
                     with open(meta_path, "w", encoding="utf-8") as f:
                         json.dump(meta, f, indent=2, ensure_ascii=False)
 
+                if getattr(cli_args, "gemini_only", False):
+                    n_ok += 1
+                    gemini_fail_streak = 0
+                    continue
+
                 if not objects:
                     log(f"  episode {prepared.ep_idx}: no objects, skip SAM3")
                     n_ok += 1
@@ -744,13 +772,22 @@ def _worker_main(
 
             elapsed = time.time() - start_t
             if n_fail == 0:
-                done_marker.write_text(
-                    f"episodes={n_ok}\nskipped={n_skip}\nt={time.time():.0f}\n"
-                )
-                log(
-                    f"[done] {shard.path} ok={n_ok} skip={n_skip} "
-                    f"elapsed={elapsed:.1f}s"
-                )
+                if getattr(cli_args, "gemini_only", False):
+                    gemini_done_marker.write_text(
+                        f"episodes={n_ok}\nskipped={n_skip}\nt={time.time():.0f}\n"
+                    )
+                    log(
+                        f"[gemini-done] {shard.path} ok={n_ok} skip={n_skip} "
+                        f"elapsed={elapsed:.1f}s"
+                    )
+                else:
+                    done_marker.write_text(
+                        f"episodes={n_ok}\nskipped={n_skip}\nt={time.time():.0f}\n"
+                    )
+                    log(
+                        f"[done] {shard.path} ok={n_ok} skip={n_skip} "
+                        f"elapsed={elapsed:.1f}s"
+                    )
             else:
                 log(
                     f"[partial] {shard.path} ok={n_ok} fail={n_fail} "
@@ -762,7 +799,8 @@ def _worker_main(
         finally:
             claim_path.unlink(missing_ok=True)
 
-    gemini_pool.shutdown(wait=True, cancel_futures=True)
+    if gemini_pool is not None:
+        gemini_pool.shutdown(wait=True, cancel_futures=True)
     log("exit")
 
 
@@ -863,8 +901,18 @@ def main():
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--claim-stale-secs", type=int, default=7200)
     ap.add_argument("--list-only", action="store_true")
+    ap.add_argument(
+        "--gemini-only", action="store_true",
+        help="只调 Gemini 写 metadata.json，跳过 SAM3。完成后写 _GEMINI_DONE。",
+    )
+    ap.add_argument(
+        "--sam3-only", action="store_true",
+        help="只跑 SAM3，读已有 metadata.json，不调 Gemini。需先跑 --gemini-only。",
+    )
 
     args = ap.parse_args()
+    if args.gemini_only and args.sam3_only:
+        raise ValueError("--gemini-only 和 --sam3-only 不能同时使用")
 
     gpu_ids = [g.strip() for g in args.gpus.split(",") if g.strip()]
     if not gpu_ids:
