@@ -37,7 +37,7 @@ fi
 
 # ---- clash 代理 ----
 CLASH_BIN=/public/home/lulucai/vpn/clash/clash-linux-amd64-v1.10.0
-CLASH_CFG=/public/home/lulucai/vpn/clash/BitzNet_us_only.yaml
+CLASH_CFG=/public/home/lulucai/vpn/clash/BitzNet.yaml
 CLASH_DIR=/tmp/clash-${SLURM_JOB_ID:-$$}
 mkdir -p "$CLASH_DIR"
 cp "$CLASH_CFG" "$CLASH_DIR/"
@@ -108,6 +108,7 @@ $PY scripts/batch_oxe_fast.py \
   --gemini-model gemini-2.5-flash-lite \
   --confidence 0.5 \
   --save-vis \
+  --gemini-max-consecutive-failures 50 \
   --datasets language_table
 
 echo "Done -> /public/home/lulucai/data/oxe_seg/language_table"

@@ -42,7 +42,7 @@ fi
 
 # ---- 起 clash 代理（compute node 不能直连 Gemini） ----
 CLASH_BIN=/public/home/lulucai/vpn/clash/clash-linux-amd64-v1.10.0
-CLASH_CFG=/public/home/lulucai/vpn/clash/BitzNet_us_only.yaml
+CLASH_CFG=/public/home/lulucai/vpn/clash/BitzNet.yaml
 CLASH_DIR=/tmp/clash-${SLURM_JOB_ID:-$$}
 mkdir -p "$CLASH_DIR"
 cp "$CLASH_CFG" "$CLASH_DIR/"
@@ -115,6 +115,7 @@ $PY scripts/batch_oxe_fast.py \
   --gemini-model gemini-2.5-flash-lite \
   --confidence 0.5 \
   --save-vis \
+  --gemini-max-consecutive-failures 50 \
   --datasets fractal20220817_data,kuka,bridge,taco_play,jaco_play,berkeley_cable_routing,roboturk,viola,berkeley_autolab_ur5,toto,language_table,stanford_hydra_dataset_converted_externally_to_rlds,austin_buds_dataset_converted_externally_to_rlds,nyu_franka_play_dataset_converted_externally_to_rlds,furniture_bench_dataset_converted_externally_to_rlds,ucsd_kitchen_dataset_converted_externally_to_rlds,austin_sailor_dataset_converted_externally_to_rlds,austin_sirius_dataset_converted_externally_to_rlds,dlr_edan_shared_control_converted_externally_to_rlds,iamlab_cmu_pickup_insert_converted_externally_to_rlds,utaustin_mutex,berkeley_fanuc_manipulation,cmu_stretch,bc_z,fmb,dobbe,droid
 
 echo "Done -> /public/home/lulucai/data/oxe_seg"
