@@ -931,7 +931,7 @@ def main():
     )
 
     api_key = args.gemini_api_key or os.environ.get("GOOGLE_API_KEY")
-    if not args.skip_gemini and not api_key:
+    if not args.skip_gemini and not getattr(args, "sam3_only", False) and not api_key:
         raise ValueError(
             "Set GOOGLE_API_KEY or pass --gemini-api-key (or --skip-gemini)"
         )
