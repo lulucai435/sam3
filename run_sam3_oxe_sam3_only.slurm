@@ -27,9 +27,7 @@ if [ ! -x "$PY" ]; then
   echo "ERROR: $PY 不存在。" >&2; exit 1
 fi
 
-if [ -z "${SCT_KEY:-}" ]; then
-  export SCT_KEY=SCT350071TJOoEoItfmHndY5peyRCcCrDZ
-fi
+source /public/home/lulucai/.sam3_secrets
 
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 

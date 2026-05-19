@@ -25,12 +25,7 @@ if [ ! -x "$PY" ]; then
   echo "ERROR: $PY 不存在。" >&2; exit 1
 fi
 
-if [ -z "${GOOGLE_API_KEY:-}" ]; then
-  export GOOGLE_API_KEY=AIzaSyCPlpLbHXadTWIaIu_4SEWNa2yDmqR-q78
-fi
-if [ -z "${SCT_KEY:-}" ]; then
-  export SCT_KEY=SCT350071TJOoEoItfmHndY5peyRCcCrDZ
-fi
+source /public/home/lulucai/.sam3_secrets
 
 # ---- clash 代理 ----
 CLASH_BIN=/public/home/lulucai/vpn/clash/clash-linux-amd64-v1.10.0
