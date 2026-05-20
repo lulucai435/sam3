@@ -1020,6 +1020,8 @@ def main():
             p.start()
             procs.append(p)
             wid += 1
+            if wid < num_workers:
+                time.sleep(3)  # 错开 worker 启动，避免同时读共享盘上的 SAM3 权重
 
     def _send_stop():
         for _ in range(num_workers):
@@ -1052,22 +1054,31 @@ def main():
             version_policy=args.version_policy,
             shard_group_policy=args.shard_group_policy,
         )
+        # 用收缩列表代替每轮全量扫描：已完成/已入队的 shard 从列表中移除，
+        # 避免随进度积累的 stat() 突发量随 shard 总数线性增长。
+        pending_shards = [s for s in all_shards_src if s.path not in queued_paths]
         while True:
             time.sleep(poll_interval)
-            new = [
-                s for s in all_shards_src
-                if s.path not in queued_paths
-                and (args.output_root / s.rel_out / "_GEMINI_DONE").exists()
-                and not (args.output_root / s.rel_out / "_DONE").exists()
-            ]
+            new: list = []
+            next_pending: list = []
+            for s in pending_shards:
+                out_dir = args.output_root / s.rel_out
+                if (out_dir / "_DONE").exists():
+                    pass  # 已由其他 worker 完成，直接丢弃
+                elif (out_dir / "_GEMINI_DONE").exists():
+                    new.append(s)  # 可以入队
+                else:
+                    next_pending.append(s)  # Gemini 还没跑完，留到下轮
+            pending_shards = next_pending  # 已入队/已完成的 shard 不再检查
+
             for s in new:
                 task_q.put(s)
                 queued_paths.add(s.path)
             if new:
-                print(f"[live] queued {len(new)} new shards (total queued: {len(queued_paths)})", flush=True)
-            # 退出条件：sentinel 存在且没有新 shard
-            if sentinel.exists() and not new:
-                print("[live] _ALL_GEMINI_DONE seen + no new shards → stopping workers", flush=True)
+                print(f"[live] queued {len(new)} new shards (total queued: {len(queued_paths)}, still pending: {len(pending_shards)})", flush=True)
+            # 退出条件：sentinel 存在且没有待处理 shard
+            if sentinel.exists() and not pending_shards and not new:
+                print("[live] _ALL_GEMINI_DONE seen + no pending shards → stopping workers", flush=True)
                 _send_stop()
                 break
 
