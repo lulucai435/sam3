@@ -1076,9 +1076,12 @@ def main():
                 queued_paths.add(s.path)
             if new:
                 print(f"[live] queued {len(new)} new shards (total queued: {len(queued_paths)}, still pending: {len(pending_shards)})", flush=True)
-            # 退出条件：sentinel 存在且没有待处理 shard
-            if sentinel.exists() and not pending_shards and not new:
-                print("[live] _ALL_GEMINI_DONE seen + no pending shards → stopping workers", flush=True)
+            # 退出条件：sentinel 存在且本轮没有新 shard 入队。
+            # 注意不能用 `not pending_shards`：gemini 跳过/失败的 shard 永远拿不到
+            # _GEMINI_DONE，会一直留在 pending_shards 里，那样会死循环。sentinel 一旦
+            # 出现就说明不会再有新的 _GEMINI_DONE，剩下的 pending 是卡住的、应当放弃。
+            if sentinel.exists() and not new:
+                print("[live] _ALL_GEMINI_DONE seen + no new shards → stopping workers", flush=True)
                 _send_stop()
                 break
 
