@@ -374,11 +374,17 @@ def _sam3_and_save(
             if cli_args.max_segment_frames is not None:
                 indices = indices[: cli_args.max_segment_frames]
 
-        vis_set = (
-            set(prepared.sampled_indices)
-            if (cli_args.save_vis and cam == prepared.primary_cam)
-            else set()
-        )
+        if cli_args.save_vis and cam == prepared.primary_cam:
+            si = list(prepared.sampled_indices)
+            n_vis = max(0, int(getattr(cli_args, "vis_per_episode", 2)))
+            if n_vis and len(si) > n_vis:
+                # 从采样帧里均匀挑 n_vis 张（首尾兼顾），减少写盘
+                pick = {int(round(j * (len(si) - 1) / (n_vis - 1))) for j in range(n_vis)} \
+                    if n_vis > 1 else {0}
+                si = [si[p] for p in sorted(pick)]
+            vis_set = set(si)
+        else:
+            vis_set = set()
 
         to_do: list[tuple[int, Image.Image, bool, bool]] = []
         for t in indices:
@@ -879,6 +885,12 @@ def main():
     ap.add_argument("--segment-every-n", type=int, default=10)
     ap.add_argument("--max-segment-frames", type=int, default=None)
     ap.add_argument("--save-vis", action="store_true")
+    ap.add_argument(
+        "--vis-per-episode",
+        type=int,
+        default=2,
+        help="每个 episode 最多存几张 vis PNG（从采样帧均匀挑），减少写盘。0=不限。",
+    )
     ap.add_argument(
         "--batch-size",
         type=int,

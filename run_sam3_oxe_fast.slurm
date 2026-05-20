@@ -85,6 +85,24 @@ export NO_PROXY=localhost,127.0.0.1,::1,huggingface.co
 # allocator 扩张段配合 OOM 减半重试。
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 
+# ---- IO / 性能优化：减少对共享存储的高频访问 ----
+# matplotlib 字体缓存放节点本地，避免多 worker 并发扫描共享FS上的 fontlist/DejaVuSans.ttf
+export MPLCONFIGDIR="/tmp/mpl-${USER}-${SLURM_JOB_ID:-$$}"
+export MPLBACKEND=Agg
+mkdir -p "$MPLCONFIGDIR"
+# 单线程预热字体缓存，让后续所有 worker 直接读暖缓存、不再各自重建
+$PY -c "import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot" >/dev/null 2>&1 || true
+# HF 离线：SAM3 权重已在缓存，禁掉每个 worker 启动时的 HTTP 元数据探测（Gemini 走 clash 不受影响）
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_HUB_DISABLE_TELEMETRY=1
+# 限制每 worker 的 BLAS/OMP 线程，避免多进程 × 满核线程互抢 CPU、拖慢 IO 线程
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export TOKENIZERS_PARALLELISM=false
+# 不往共享 venv 写 .pyc
+export PYTHONDONTWRITEBYTECODE=1
+
 echo "=== 环境 ==="
 echo "Python:      $PY"
 $PY --version

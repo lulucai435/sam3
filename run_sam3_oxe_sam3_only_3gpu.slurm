@@ -1,20 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=sam3_oxe_sam3
+#SBATCH --job-name=sam3_oxe_sam3_3g
 #SBATCH --chdir=/public/home/lulucai/code/sam3
-#SBATCH --output=/public/home/lulucai/code/sam3/logs/sam3_oxe_sam3_%j.out
-#SBATCH --error=/public/home/lulucai/code/sam3/logs/sam3_oxe_sam3_%j.err
+#SBATCH --output=/public/home/lulucai/code/sam3/logs/sam3_oxe_sam3_3g_%j.out
+#SBATCH --error=/public/home/lulucai/code/sam3/logs/sam3_oxe_sam3_3g_%j.err
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:8
+#SBATCH --gres=gpu:3
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=20
+#SBATCH --cpus-per-task=8
 #SBATCH --time=120:00:00
-#SBATCH --mem=120G
+#SBATCH --mem=45G
 
-# Stage 2：读 metadata.json（_GEMINI_DONE 的 shard）只跑 SAM3，不调 Gemini。
-# 不需要 clash 代理，纯 GPU 计算。
-# 先确保 run_sam3_oxe_gemini_only.slurm 跑完再提交本脚本。
+# Stage 2 (3卡版)：读 metadata.json（_GEMINI_DONE 的 shard）只跑 SAM3，不调 Gemini。
+# 与 4/8 卡版完全兼容（claim-lock 共享）。
 # 用法（mgmt 节点）：
-#   sbatch run_sam3_oxe_sam3_only.slurm
+#   sbatch run_sam3_oxe_sam3_only_3gpu.slurm
 
 set -euo pipefail
 
@@ -58,7 +57,7 @@ echo "============"
 
 NUM_GPUS=$($PY -c 'import torch; print(torch.cuda.device_count())')
 GPU_IDS=$($PY -c "print(','.join(str(i) for i in range($NUM_GPUS)))")
-echo "Using GPU ids: ${GPU_IDS} (2 workers/gpu=16 total, sam3-only-live, polling every 120s)"
+echo "Using GPU ids: ${GPU_IDS} (2 workers/gpu=6 total, sam3-only-live, polling every 120s)"
 
 $PY scripts/batch_oxe_fast.py \
   --dataset-root /public/home/lisunhku/tensorflow_datasets \

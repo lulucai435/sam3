@@ -264,6 +264,8 @@ def _save_vis(
     Right panel shows the same frame with SAM3 masks overlaid, label list in corner.
     """
     try:
+        import matplotlib
+        matplotlib.use("Agg")  # 无头后端，避免探测显示设备
         import matplotlib.pyplot as plt
     except ImportError:
         return
