@@ -53,6 +53,12 @@ ALL_CATEGORIES = ROBOT_CATEGORIES + NON_ROBOT_CATEGORIES
 
 CANONICAL_ARM_LABEL = "robotic arm"  # post-normalization
 
+# Gemini sometimes leaks dict reprs like "{'box_2d': [0, 0, 1000, 1000],
+# 'label': 'robotic arm'}" into the objects list; after normalize_label they
+# become "box 2d <nums> label <text>". Such labels are malformed artifacts
+# (often hallucinated on nav datasets) and must never enter the registry.
+MALFORMED_LABEL_RE = re.compile(r"^box 2d\b")
+
 PROMPT_VERSION = "robot-label-v1"
 
 
@@ -1485,7 +1491,12 @@ def stage_finalize(out_dir: Path, manual_overrides_path: Path | None,
     all_classifications: dict[str, dict] = {}
     all_labels = set(per_label_votes) | set(vl_results) | set(vocab["labels"])
     for lbl in sorted(all_labels):
-        if lbl in overrides:
+        if MALFORMED_LABEL_RE.match(lbl):
+            all_classifications[lbl] = {
+                "category": "non_robot", "confidence": 1.0,
+                "source": "malformed_filter", "inconsistent": False,
+            }
+        elif lbl in overrides:
             all_classifications[lbl] = {
                 "category": overrides[lbl], "confidence": 1.0,
                 "source": "manual_override", "inconsistent": False,
