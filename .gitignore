@@ -144,6 +144,9 @@ logs/
 runs/
 tensorboard/
 
+# Build-OXE-robot-label-registry outputs (large derived files, regenerable)
+reports/oxe_robot_labels/
+
 # OS specific
 .DS_Store
 Thumbs.db
