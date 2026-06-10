@@ -1145,7 +1145,9 @@ def stage_verify_vl(out_dir: Path, model: str, vis_per_unit: int = 3,
                     include_multi: bool = True,
                     include_single_nc: bool = True,
                     include_uncertain: bool = True,
-                    workers: int = 1) -> dict:
+                    workers: int = 1,
+                    reverify_labels_matching: list[str] | None = None,
+                    force_reverify: bool = False) -> dict:
     """Stage 3: vision verify ambiguous units.
 
     Three kinds of units (any combination via include_* flags):
@@ -1186,18 +1188,42 @@ def stage_verify_vl(out_dir: Path, model: str, vis_per_unit: int = 3,
             if paths:
                 units.append({"kind": "uncertain", "labels": [lbl], "paths": paths})
 
+    # Optional substring filter on labels (used for targeted re-verification)
+    if reverify_labels_matching:
+        substrs = [s.strip().lower() for s in reverify_labels_matching if s.strip()]
+        def _hit(u):
+            return any(any(sub in lbl.lower() for sub in substrs) for lbl in u["labels"])
+        units = [u for u in units if _hit(u)]
+        print(f"[verify-vl] label-substr filter {substrs}: kept {len(units)} units",
+              flush=True)
+
     kinds_count = Counter(u["kind"] for u in units)
     print(f"[verify-vl] {len(units)} units to verify ({dict(kinds_count)})", flush=True)
 
     out_path = out_dir / "vision_verifications.jsonl"
     done_keys: set[str] = set()
-    if out_path.exists():
+    if out_path.exists() and not force_reverify:
         with open(out_path, encoding="utf-8") as f:
             for line in f:
                 try:
                     done_keys.add(json.loads(line)["unit_key"])
                 except Exception:
                     continue
+    elif out_path.exists() and force_reverify:
+        # Remove only entries for units we're about to re-verify (keep others intact)
+        targeted_keys = set(u["kind"] + "::" + " | ".join(u["labels"]) for u in units)
+        kept_lines: list[str] = []
+        with open(out_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    if json.loads(line).get("unit_key") in targeted_keys:
+                        continue
+                except Exception:
+                    pass
+                kept_lines.append(line)
+        out_path.write_text("".join(kept_lines))
+        print(f"[verify-vl] force-reverify: stripped {len(targeted_keys)} target unit "
+              f"records from existing JSONL", flush=True)
 
     total_usage = Counter()
     n_fail = 0
@@ -1365,7 +1391,8 @@ def build_vocabulary(index_path: Path, sample_n: int = 5) -> dict:
 
 
 def stage_finalize(out_dir: Path, manual_overrides_path: Path | None,
-                   low_conf_threshold: float, model: str) -> dict:
+                   low_conf_threshold: float, model: str,
+                   strict_robot_conf: float | None = None) -> dict:
     """Stage 4: build the 5 output files."""
     index_path = out_dir / "metadata_index.jsonl"
 
@@ -1427,8 +1454,11 @@ def stage_finalize(out_dir: Path, manual_overrides_path: Path | None,
     overrides = load_manual_overrides(manual_overrides_path)
 
     def decide(votes: list[dict], vl_votes: list[dict]) -> dict:
-        """Decision: VL trumps text. Inconsistent VL → uncertain. Majority by count + max-avg-conf tiebreak."""
-        # Prefer VL if any
+        """Decision: VL trumps text. Inconsistent VL → uncertain. Majority by count + max-avg-conf tiebreak.
+
+        If strict_robot_conf is set: a ROBOT-category VL decision with avg confidence
+        below the threshold is demoted to 'uncertain' (strict registry mode).
+        """
         primary = vl_votes if vl_votes else votes
         source = "qwen_vl" if vl_votes else "qwen_text"
         if any(v.get("inconsistent") for v in primary):
@@ -1439,10 +1469,16 @@ def stage_finalize(out_dir: Path, manual_overrides_path: Path | None,
         for v in primary:
             cat_counts[v["category"]] += 1
             cat_conf[v["category"]].append(v["confidence"])
-        # Most common, ties broken by max avg conf
         best_cat = max(cat_counts, key=lambda c: (cat_counts[c],
                        sum(cat_conf[c]) / len(cat_conf[c])))
         avg_conf = sum(cat_conf[best_cat]) / len(cat_conf[best_cat])
+        if (strict_robot_conf is not None
+                and source == "qwen_vl"
+                and best_cat in ROBOT_CATEGORIES
+                and avg_conf < strict_robot_conf):
+            return {"category": "uncertain", "confidence": round(avg_conf, 3),
+                    "source": source, "inconsistent": False,
+                    "demoted_from": best_cat}
         return {"category": best_cat, "confidence": round(avg_conf, 3),
                 "source": source, "inconsistent": False}
 
@@ -1617,6 +1653,15 @@ def build_argparser() -> argparse.ArgumentParser:
                     choices=["all", "uncertain", "multi", "single-nc",
                              "uncertain+multi"],
                     help="Restrict Stage 3 vision verify to specific unit kinds.")
+    ap.add_argument("--reverify-labels-matching", default="",
+                    help="Comma-separated substrings; only verify units whose label "
+                         "contains any of them (used for targeted strict re-pass).")
+    ap.add_argument("--force-reverify", action="store_true",
+                    help="Re-run VL even for units already in vision_verifications.jsonl. "
+                         "Old entries for the targeted units are stripped first.")
+    ap.add_argument("--strict-robot-conf", type=float, default=None,
+                    help="Stage 4: any VL robot decision with avg confidence below "
+                         "this threshold is demoted to 'uncertain' (kept out of registry).")
     ap.add_argument("subcommand",
                     choices=["scan", "classify", "bucket", "verify-vl", "finalize", "all"])
     return ap
@@ -1675,13 +1720,16 @@ def main() -> int:
                      classify_mode=bucket_mode)
     elif args.subcommand == "verify-vl":
         inc_m, inc_s, inc_u = _resolve_verify_filters(args.verify_only)
+        rev_match = [s for s in args.reverify_labels_matching.split(",") if s.strip()]
         stage_verify_vl(out_dir, args.model, args.vis_per_unit,
                         args.timeout, args.max_retries,
                         include_multi=inc_m, include_single_nc=inc_s,
-                        include_uncertain=inc_u, workers=args.workers)
+                        include_uncertain=inc_u, workers=args.workers,
+                        reverify_labels_matching=rev_match or None,
+                        force_reverify=args.force_reverify)
     elif args.subcommand == "finalize":
         stage_finalize(out_dir, args.manual_overrides, args.low_confidence_threshold,
-                       args.model)
+                       args.model, strict_robot_conf=args.strict_robot_conf)
     elif args.subcommand == "all":
         stage_scan(args.metadata_root, out_dir)
         s = _run_classify(args, out_dir)
