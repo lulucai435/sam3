@@ -985,21 +985,44 @@ def stage_bucket(out_dir: Path, signature_mode: str = "strict",
 # ----------------------------------------------------------------- Stage 3
 
 
-_SYSTEM_PROMPT_VL = """You are verifying robot-related labels by looking at example images.
+_SYSTEM_PROMPT_VL = """You are verifying object labels detected from a robot-manipulation episode.
 
-You will receive:
-- A list of candidate labels suspected to be robot-related (from one episode's
-  detected objects).
-- 1-3 visualization images (vis_*.png) showing the scene the labels came from.
+CONTEXT YOU WILL RECEIVE
+- The dataset name (e.g., conq_hose_manipulation, kuka, droid).
+- The episode's language_instruction.
+- The COMPLETE objects list detected for this episode (so you know what else is in the scene).
+- One or more visualization images (vis_*.png) from the episode.
+- The specific candidate label(s) to verify.
 
-For each candidate label, decide:
-- Is the label referring to PART OF THE OPERATING ROBOT (arm, gripper,
-  end-effector, base/body of a multi-robot platform like Spot quadruped)?
-- Or to a NON-ROBOT scene object (toy, sticker, poster, person, furniture, tool)?
-- Or UNCERTAIN (cannot tell from images)?
+YOUR TASK
+For each candidate label, decide its category:
+- robotic_arm: ANY structural part of the operating robot platform — arm,
+  base, body, head, torso, foot, joint, shoulder, chassis. Multi-robot
+  platforms (Boston Dynamics Spot quadruped, mobile manipulators, SARA) — the
+  WHOLE body counts, not just the arm. Color/material variants are fine
+  ("yellow robot" on a yellow Spot → robotic_arm).
+- gripper: gripper, robotic claw, parallel/suction gripper, jaws.
+- end_effector: robot hand, robot wrist, tool flange (terminal mechanism).
+- non_robot: scene object, toy, sticker, decoration, person, furniture, food.
+- uncertain: only when images are too unclear to decide.
 
-If the images give conflicting signals (one image shows the label as the robot
-body, another shows it as a scene toy), set "inconsistent": true.
+CRITICAL DECISION RULES
+1. If the images clearly show the label points to a physical part of the
+   operating robot platform (including quadruped body for Spot), classify it
+   as robotic_arm/gripper/end_effector. Do NOT hedge to non_robot just because
+   the label string is ambiguous in isolation.
+2. Dedup rule: another model already produced this objects list with the
+   instruction "name the robot as a SINGLE entry 'robotic arm', one entry per
+   unique object instance class". So if "robotic arm" AND another robot-ish
+   label both appear in the objects list, they MUST refer to DIFFERENT physical
+   things — typically the arm vs. the platform body (Spot body, base, head, foot).
+3. Use the dataset name as a strong prior:
+   - conq_hose_manipulation → Boston Dynamics Spot, body is YELLOW
+   - droid → Franka Panda arm (mostly black/white, on a stand)
+   - kuka → KUKA arm (often orange/blue/silver)
+   - language_table → small tabletop, may have toy robots or no robot body
+4. If 3 images disagree (one shows robot body, another shows a toy), set
+   "inconsistent": true and choose the dominant category.
 
 OUTPUT — STRICT JSON ONLY:
 {
@@ -1057,14 +1080,17 @@ def find_vis_for_path(metadata_path: Path) -> Path | None:
 
 
 def call_qwen_vl(candidate_labels: list[str],
-                 instruction: str,
+                 context: dict,
                  vis_paths: list[Path],
                  model: str,
                  api_key: str,
                  timeout: float = 180.0,
                  max_retries: int = 3,
                  image_max_side: int = 768) -> dict:
-    """Call Qwen-VL with text + images. Returns parsed dict {labels: [...]}."""
+    """Call Qwen-VL with text + images. Returns parsed dict {labels: [...]}.
+
+    context: {dataset, instruction, all_objects: list[str]}
+    """
     content: list[dict] = []
     for p in vis_paths:
         try:
@@ -1076,9 +1102,13 @@ def call_qwen_vl(candidate_labels: list[str],
         except Exception:
             continue
     user_text = (
-        "Episode language_instruction: " + (instruction or "(none)") + "\n"
-        "Candidate labels to verify: " + json.dumps(candidate_labels, ensure_ascii=False) + "\n"
-        "Look at the image(s) and classify each label."
+        "Dataset: " + (context.get("dataset") or "(unknown)") + "\n"
+        "language_instruction: " + (context.get("instruction") or "(none)") + "\n"
+        "Complete objects list for this episode: "
+        + json.dumps(context.get("all_objects") or [], ensure_ascii=False) + "\n"
+        "Candidate labels to verify: "
+        + json.dumps(candidate_labels, ensure_ascii=False) + "\n"
+        "Look at the image(s), use the dataset/instruction as priors, and classify each candidate."
     )
     content.append({"type": "text", "text": user_text})
     body = {
@@ -1111,32 +1141,53 @@ def call_qwen_vl(candidate_labels: list[str],
 
 def stage_verify_vl(out_dir: Path, model: str, vis_per_unit: int = 3,
                     timeout: float = 180.0, max_retries: int = 3,
-                    seed: int = 42) -> dict:
-    """Stage 3: vision verify bucket_multi + non-canonical bucket_single."""
+                    seed: int = 42,
+                    include_multi: bool = True,
+                    include_single_nc: bool = True,
+                    include_uncertain: bool = True,
+                    workers: int = 1) -> dict:
+    """Stage 3: vision verify ambiguous units.
+
+    Three kinds of units (any combination via include_* flags):
+    - multi: bucket_multi unique combos (different physical robot parts in same scene)
+    - single_non_canonical: bucket_single with label != 'robotic arm'
+    - uncertain: labels Qwen text-classified as 'uncertain' (color+robot, lone arm, etc.)
+    """
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
         raise SystemExit("DASHSCOPE_API_KEY not set in environment")
 
-    bucket_single = json.loads((out_dir / "bucket_single.json").read_text())
-    bucket_multi = json.loads((out_dir / "bucket_multi.json").read_text())
-
     rng = random.Random(seed)
-
     units: list[dict] = []
-    # bucket_multi: every unique combo
-    for combo_str, paths in bucket_multi.items():
-        labels = combo_str.split(" | ")
-        units.append({"kind": "multi", "labels": labels, "paths": paths})
-    # bucket_single: only non-canonical labels
-    for lbl, paths in bucket_single.items():
-        if lbl == CANONICAL_ARM_LABEL:
-            continue
-        units.append({"kind": "single_non_canonical", "labels": [lbl], "paths": paths})
 
-    print(f"[verify-vl] {len(units)} units to verify "
-          f"({sum(1 for u in units if u['kind']=='multi')} multi-combos, "
-          f"{sum(1 for u in units if u['kind']=='single_non_canonical')} non-canonical singles)",
-          flush=True)
+    if include_multi:
+        bucket_multi = json.loads((out_dir / "bucket_multi.json").read_text())
+        for combo_str, paths in bucket_multi.items():
+            labels = combo_str.split(" | ")
+            units.append({"kind": "multi", "labels": labels, "paths": paths})
+    if include_single_nc:
+        bucket_single = json.loads((out_dir / "bucket_single.json").read_text())
+        for lbl, paths in bucket_single.items():
+            if lbl == CANONICAL_ARM_LABEL:
+                continue
+            units.append({"kind": "single_non_canonical", "labels": [lbl], "paths": paths})
+    if include_uncertain:
+        all_cls_path = out_dir / "all_label_classifications.json"
+        vocab_path = out_dir / "object_label_vocabulary.json"
+        if not all_cls_path.exists() or not vocab_path.exists():
+            raise SystemExit("uncertain mode needs all_label_classifications.json and "
+                             "object_label_vocabulary.json; run `finalize` first")
+        all_cls = json.loads(all_cls_path.read_text())
+        vocab = json.loads(vocab_path.read_text()).get("labels", {})
+        for lbl, info in all_cls.items():
+            if info.get("category") != "uncertain":
+                continue
+            paths = vocab.get(lbl, {}).get("example_paths", [])
+            if paths:
+                units.append({"kind": "uncertain", "labels": [lbl], "paths": paths})
+
+    kinds_count = Counter(u["kind"] for u in units)
+    print(f"[verify-vl] {len(units)} units to verify ({dict(kinds_count)})", flush=True)
 
     out_path = out_dir / "vision_verifications.jsonl"
     done_keys: set[str] = set()
@@ -1150,51 +1201,103 @@ def stage_verify_vl(out_dir: Path, model: str, vis_per_unit: int = 3,
 
     total_usage = Counter()
     n_fail = 0
-    with open(out_path, "a", encoding="utf-8") as out_f:
-        for ui, unit in enumerate(units):
-            key = unit["kind"] + "::" + " | ".join(unit["labels"])
-            if key in done_keys:
-                continue
-            paths = unit["paths"]
-            sampled = rng.sample(paths, min(vis_per_unit, len(paths)))
-            vis_paths: list[Path] = []
-            for p_str in sampled:
-                vp = find_vis_for_path(Path(p_str))
-                if vp is not None:
-                    vis_paths.append(vp)
-            if not vis_paths:
-                out_f.write(json.dumps({
-                    "unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
-                    "error": "no vis images found",
-                    "sampled_paths": sampled,
-                }, ensure_ascii=False) + "\n")
-                n_fail += 1
-                continue
-            # Use the instruction from the first sampled metadata
-            try:
-                instr = json.loads(Path(sampled[0]).read_text()).get("language_instruction", "")
-            except Exception:
-                instr = ""
-            try:
-                parsed = call_qwen_vl(unit["labels"], instr, vis_paths,
-                                      model, api_key, timeout, max_retries)
-                usage = parsed.get("_usage") or {}
-                for k, v in usage.items():
-                    if isinstance(v, int):
-                        total_usage[k] += v
-                out_f.write(json.dumps({
-                    "unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
+    n_done_total = 0
+    t0 = time.time()
+
+    def _process_unit(unit: dict) -> dict:
+        """Run one unit. Returns a dict ready to write to JSONL."""
+        key = unit["kind"] + "::" + " | ".join(unit["labels"])
+        paths = unit["paths"]
+        sampled = rng.sample(paths, min(vis_per_unit, len(paths)))
+        vis_paths: list[Path] = []
+        for p_str in sampled:
+            vp = find_vis_for_path(Path(p_str))
+            if vp is not None:
+                vis_paths.append(vp)
+        if not vis_paths:
+            return {"unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
+                    "error": "no vis images found", "sampled_paths": sampled}
+        ctx = {"dataset": "", "instruction": "", "all_objects": []}
+        try:
+            m = json.loads(Path(sampled[0]).read_text())
+            ctx["instruction"] = m.get("language_instruction", "") or ""
+            ctx["all_objects"] = list(m.get("objects") or [])
+            # dataset = first component under metadata_root (best-effort by path split)
+            parts = Path(sampled[0]).parts
+            if "oxe_seg" in parts:
+                idx = parts.index("oxe_seg")
+                if idx + 1 < len(parts):
+                    ctx["dataset"] = parts[idx + 1]
+        except Exception:
+            pass
+        try:
+            parsed = call_qwen_vl(unit["labels"], ctx, vis_paths,
+                                  model, api_key, timeout, max_retries)
+            return {"unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
+                    "dataset": ctx["dataset"], "instruction": ctx["instruction"],
                     "vis_paths": [str(p) for p in vis_paths],
                     "result": parsed.get("labels", []),
-                }, ensure_ascii=False) + "\n")
-            except Exception as e:
-                n_fail += 1
-                out_f.write(json.dumps({
-                    "unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
-                    "error": str(e),
-                }, ensure_ascii=False) + "\n")
-            print(f"[verify-vl] {ui+1}/{len(units)} done  fails={n_fail}  usage={dict(total_usage)}",
-                  flush=True)
+                    "_usage": parsed.get("_usage") or {}}
+        except Exception as e:
+            return {"unit_key": key, "kind": unit["kind"], "labels": unit["labels"],
+                    "error": str(e)}
+
+    todo_units = [u for u in units
+                  if (u["kind"] + "::" + " | ".join(u["labels"])) not in done_keys]
+    print(f"[verify-vl] resuming, {len(done_keys)} already done, {len(todo_units)} to do",
+          flush=True)
+
+    with open(out_path, "a", encoding="utf-8") as out_f:
+        if workers <= 1:
+            for ui, unit in enumerate(todo_units):
+                res = _process_unit(unit)
+                if "error" in res:
+                    n_fail += 1
+                else:
+                    usage = res.pop("_usage", {})
+                    for k, v in usage.items():
+                        if isinstance(v, int):
+                            total_usage[k] += v
+                out_f.write(json.dumps(res, ensure_ascii=False) + "\n")
+                out_f.flush()
+                n_done_total += 1
+                elapsed = time.time() - t0
+                rate = n_done_total / max(elapsed, 1e-3)
+                eta = (len(todo_units) - n_done_total) / max(rate, 1e-3)
+                print(f"[verify-vl] {n_done_total}/{len(todo_units)} fails={n_fail} "
+                      f"rate={rate:.2f}/s eta={eta:.0f}s usage={dict(total_usage)}",
+                      flush=True)
+        else:
+            import threading
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            write_lock = threading.Lock()
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_process_unit, u): u for u in todo_units}
+                for fut in as_completed(futs):
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        u = futs[fut]
+                        res = {"unit_key": u["kind"] + "::" + " | ".join(u["labels"]),
+                               "kind": u["kind"], "labels": u["labels"],
+                               "error": f"worker raised: {e}"}
+                    with write_lock:
+                        if "error" in res:
+                            n_fail += 1
+                        else:
+                            usage = res.pop("_usage", {})
+                            for k, v in usage.items():
+                                if isinstance(v, int):
+                                    total_usage[k] += v
+                        out_f.write(json.dumps(res, ensure_ascii=False) + "\n")
+                        out_f.flush()
+                        n_done_total += 1
+                        elapsed = time.time() - t0
+                        rate = n_done_total / max(elapsed, 1e-3)
+                        eta = (len(todo_units) - n_done_total) / max(rate, 1e-3)
+                        print(f"[verify-vl] {n_done_total}/{len(todo_units)} fails={n_fail} "
+                              f"rate={rate:.2f}/s eta={eta:.0f}s usage={dict(total_usage)}",
+                              flush=True)
 
     summary = {
         "total_units": len(units),
@@ -1509,7 +1612,11 @@ def build_argparser() -> argparse.ArgumentParser:
                          "normalized label, isolated (much cheaper, recommended).")
     ap.add_argument("--workers", type=int, default=1,
                     help="Parallel HTTP workers for per-label classification "
-                         "(safe values: 1-8).")
+                         "and vision verification (safe values: 1-8).")
+    ap.add_argument("--verify-only", default="all",
+                    choices=["all", "uncertain", "multi", "single-nc",
+                             "uncertain+multi"],
+                    help="Restrict Stage 3 vision verify to specific unit kinds.")
     ap.add_argument("subcommand",
                     choices=["scan", "classify", "bucket", "verify-vl", "finalize", "all"])
     return ap
@@ -1525,6 +1632,21 @@ def _run_classify(args, out_dir: Path) -> dict:
                           args.timeout, args.max_retries,
                           force=args.force_reclassify,
                           signature_mode=args.signature_mode)
+
+
+def _resolve_verify_filters(verify_only: str) -> tuple[bool, bool, bool]:
+    """Returns (include_multi, include_single_nc, include_uncertain)."""
+    if verify_only == "all":
+        return True, True, True
+    if verify_only == "uncertain":
+        return False, False, True
+    if verify_only == "multi":
+        return True, False, False
+    if verify_only == "single-nc":
+        return False, True, False
+    if verify_only == "uncertain+multi":
+        return True, False, True
+    return True, True, True
 
 
 def main() -> int:
@@ -1552,8 +1674,11 @@ def main() -> int:
         stage_bucket(out_dir, signature_mode=args.signature_mode,
                      classify_mode=bucket_mode)
     elif args.subcommand == "verify-vl":
+        inc_m, inc_s, inc_u = _resolve_verify_filters(args.verify_only)
         stage_verify_vl(out_dir, args.model, args.vis_per_unit,
-                        args.timeout, args.max_retries)
+                        args.timeout, args.max_retries,
+                        include_multi=inc_m, include_single_nc=inc_s,
+                        include_uncertain=inc_u, workers=args.workers)
     elif args.subcommand == "finalize":
         stage_finalize(out_dir, args.manual_overrides, args.low_confidence_threshold,
                        args.model)
@@ -1562,8 +1687,13 @@ def main() -> int:
         s = _run_classify(args, out_dir)
         stage_bucket(out_dir, signature_mode=args.signature_mode,
                      classify_mode=bucket_mode)
+        stage_finalize(out_dir, args.manual_overrides, args.low_confidence_threshold,
+                       args.model)
+        inc_m, inc_s, inc_u = _resolve_verify_filters(args.verify_only)
         stage_verify_vl(out_dir, args.model, args.vis_per_unit,
-                        args.timeout, args.max_retries)
+                        args.timeout, args.max_retries,
+                        include_multi=inc_m, include_single_nc=inc_s,
+                        include_uncertain=inc_u, workers=args.workers)
         stage_finalize(out_dir, args.manual_overrides, args.low_confidence_threshold,
                        args.model)
         if s.get("failed_this_run", 0) > 0:
