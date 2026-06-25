@@ -45,6 +45,13 @@ the model (or listed under missing_or_uncertain). The objects list is shown to t
 model in full and NEVER reindexed, so object_index always equals the SAM3 mask
 instance index.
 
+confidence is audit/debug only for v1 — the loader/training must NOT filter on it.
+
+Large support surfaces (table/counter/floor/wall/background) tagged as
+source_support_object are demoted to missing_or_uncertain by default
+(--exclude-large-support-objects, on by default) so the union mask =
+task_related_instances exactly. Use --no-exclude-large-support-objects to keep them.
+
 Resumability & IO discipline
 ----------------------------
 - One small file per episode on shared storage: written atomically (tmp + os.replace)
@@ -86,6 +93,15 @@ ALLOWED_ROLES = (
     "source_support_object",
 )
 
+# Large, low-information support surfaces. Even when Qwen tags one as
+# source_support_object, it should not enter the training union mask by default
+# (it dominates the frame and adds little task signal). Matched as a substring of
+# the lowercased label, so "black table" / "wall panel" are caught. Applied only
+# to the source_support_object role — a table that is a genuine target_object
+# (e.g. "put X on the table") is kept.
+DEFAULT_LARGE_SUPPORT_LABELS = ("table", "counter", "floor", "wall", "background")
+LARGE_SUPPORT_ROLES = frozenset({"source_support_object"})
+
 # Prompt is a single self-contained user message. Two placeholders are filled by
 # str.replace (NOT str.format — the body contains literal JSON braces).
 PROMPT_TEMPLATE = """You are labeling task-related objects for robot manipulation.
@@ -109,7 +125,7 @@ Return strict JSON only:
       "object_index": 0,
       "label": "...",
       "role": "...",
-      "confidence": 0.0,
+      "confidence": 0.95,
       "reason": "..."
     }
   ],
@@ -132,8 +148,12 @@ Do not select robot parts, distractors, uncertain objects, or generic background
 Important:
 - A cabinet shelf in "put the pan under/on the cabinet shelf" is target_object, not background support.
 - A table/counter/shelf is selected only if explicitly used as source or target.
+- Do not select table/counter/floor/wall/background as source_support_object unless explicitly mentioned in the instruction and necessary to identify the task. If the instruction refers to a target serving area/tray/plate/container, select that target object instead of the table.
 - If the instruction is empty or no action-related object can be selected, return an empty task_related_instances list and set valid_for_action_seg=false.
-- The label must exactly match the object label from the provided indexed list."""
+- The label must exactly match the object label from the provided indexed list.
+
+Confidence:
+- Set confidence to your estimated confidence between 0 and 1. Do not copy the placeholder value. Use higher confidence for exact matches and lower confidence for approximate or ambiguous matches."""
 
 
 # ----------------------------------------------------------------- enumerate
@@ -265,7 +285,16 @@ def call_qwen(instruction: str, objects: list[str], model: str, api_key: str,
     raise RuntimeError(f"Qwen call failed after {max_retries} attempts: {last_err}")
 
 
-def partition_result(parsed: dict, objects: list[str]) -> dict:
+def is_large_support_label(label: str, large_support_labels: frozenset[str]) -> bool:
+    """True if `label` names a large support surface (substring match, lowercased)."""
+    low = label.lower()
+    return any(kw in low for kw in large_support_labels)
+
+
+def partition_result(parsed: dict, objects: list[str],
+                     exclude_large_support: bool = True,
+                     large_support_labels: frozenset[str] = frozenset(
+                         DEFAULT_LARGE_SUPPORT_LABELS)) -> dict:
     """Validate a Qwen response against the on-disk objects list.
 
     - object_index must be a valid index into `objects`; out-of-range or
@@ -274,6 +303,11 @@ def partition_result(parsed: dict, objects: list[str]) -> dict:
     - label is overwritten with objects[object_index] (the canonical, on-disk
       label) so it always matches the mask the loader will select by index.
     - Only the 5 allowed roles survive in task_related_instances.
+    - When exclude_large_support is set, a source_support_object whose label names
+      a large support surface (table/counter/floor/wall/background) is demoted to
+      missing_or_uncertain so it never enters the union mask. The demotion is
+      recorded in the entry's reason for audit; the union = task_related_instances
+      exactly, so the loader needs no extra config.
     - valid_for_action_seg is derived from the *validated* list (not trusted from
       the model) so it can never disagree with task_related_instances.
     """
@@ -302,14 +336,27 @@ def partition_result(parsed: dict, objects: list[str]) -> dict:
         conf = min(1.0, max(0.0, conf))
         reason = str(r.get("reason", ""))
         role = r.get("role")
-        ent = {
+        if role not in ALLOWED_ROLES:
+            missing.append({
+                "object_index": idx, "label": objects[idx],
+                "reason": f"unrecognized role {role!r}; {reason}".strip("; "),
+            })
+            continue
+        if (exclude_large_support and role in LARGE_SUPPORT_ROLES
+                and is_large_support_label(objects[idx], large_support_labels)):
+            missing.append({
+                "object_index": idx, "label": objects[idx],
+                "reason": (f"demoted from {role}: large support surface excluded "
+                           f"from union; {reason}").strip("; "),
+            })
+            continue
+        task_related.append({
             "object_index": idx,
             "label": objects[idx],  # canonical label from disk, not Qwen's echo
-            "role": role if role in ALLOWED_ROLES else "uncertain",
+            "role": role,
             "confidence": round(conf, 3),
             "reason": reason,
-        }
-        (task_related if role in ALLOWED_ROLES else missing).append(ent)
+        })
 
     # Pass through the model's own missing_or_uncertain, sanitized to valid,
     # not-already-selected indices.
@@ -346,7 +393,10 @@ def _wait_one(in_flight: set):
 
 def process_episode(meta_path: Path, *, model: str, api_key: str,
                     timeout: float, max_retries: int, force: bool,
-                    proxy: str | None = None) -> str:
+                    proxy: str | None = None,
+                    exclude_large_support: bool = True,
+                    large_support_labels: frozenset[str] = frozenset(
+                        DEFAULT_LARGE_SUPPORT_LABELS)) -> str:
     """Process one episode. Returns a short status string for logging."""
     out_path = meta_path.with_name(OUTPUT_NAME)
     if out_path.exists() and not force:
@@ -378,7 +428,9 @@ def process_episode(meta_path: Path, *, model: str, api_key: str,
     except Exception as e:  # noqa: BLE001
         return f"err_qwen:{e}"
 
-    buckets = partition_result(parsed, objects)
+    buckets = partition_result(parsed, objects,
+                               exclude_large_support=exclude_large_support,
+                               large_support_labels=large_support_labels)
     payload = {
         "instruction": instruction,
         **buckets,
@@ -406,6 +458,14 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Explicit HTTP proxy for the Qwen API. Defaults to "
                         "HTTPS_PROXY/HTTP_PROXY env (the cluster's SOCKS ALL_PROXY "
                         "is intentionally ignored).")
+    p.add_argument("--exclude-large-support-objects", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Demote source_support_object instances whose label names a "
+                        "large support surface (see --large-support-labels) into "
+                        "missing_or_uncertain so they never enter the union mask. "
+                        "On by default; use --no-exclude-large-support-objects to keep them.")
+    p.add_argument("--large-support-labels", nargs="*", default=list(DEFAULT_LARGE_SUPPORT_LABELS),
+                   help="Substring keywords (lowercased) treated as large support surfaces.")
     p.add_argument("--datasets", nargs="*", default=None,
                    help="Optional dataset-name filter (first path component).")
     p.add_argument("--limit", type=int, default=0,
@@ -427,6 +487,11 @@ def main() -> int:
     proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy and not args.dry_run:
         print(f"[task-related] using HTTP proxy {proxy}", flush=True)
+
+    large_support = frozenset(s.lower() for s in args.large_support_labels)
+    if args.exclude_large_support_objects and not args.dry_run:
+        print(f"[task-related] excluding large support surfaces from union: "
+              f"{sorted(large_support)}", flush=True)
 
     if args.metadata_root is not None:
         root = args.metadata_root
@@ -494,6 +559,8 @@ def main() -> int:
             process_episode, path, model=args.model, api_key=api_key,
             timeout=args.timeout, max_retries=args.max_retries,
             force=args.force, proxy=proxy,
+            exclude_large_support=args.exclude_large_support_objects,
+            large_support_labels=large_support,
         )
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
