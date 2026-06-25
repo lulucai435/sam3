@@ -354,6 +354,10 @@ def partition_result(parsed: dict, objects: list[str],
       missing_or_uncertain so it never enters the union mask. The demotion is
       recorded in the entry's reason for audit; the union = task_related_instances
       exactly, so the loader needs no extra config.
+    - A selected instance with confidence exactly 0.0 is demoted: Qwen uses the 0.0
+      sentinel to signal self-rejection ("likely a distractor") while still forced
+      to assign a role. This is NOT threshold filtering — only the exact 0.0 value
+      is removed, never conf < some-threshold.
     - valid_for_action_seg is derived from the *validated* list (not trusted from
       the model) so it can never disagree with task_related_instances.
     """
@@ -402,6 +406,16 @@ def partition_result(parsed: dict, objects: list[str],
                 "object_index": idx, "label": objects[idx],
                 "reason": (f"demoted from {role}: large support surface excluded "
                            f"from union; {reason}").strip("; "),
+            })
+            continue
+        # Exact 0.0 sentinel only (NOT a confidence threshold): Qwen uses 0.0 to
+        # signal self-rejection / "this is likely a distractor" while still being
+        # forced to assign a role. Such entries must not enter the union.
+        if conf == 0.0:
+            missing.append({
+                "object_index": idx, "label": objects[idx],
+                "reason": ("Removed because Qwen assigned confidence 0.0, which "
+                           "indicates self-rejection / likely distractor."),
             })
             continue
         task_related.append({
