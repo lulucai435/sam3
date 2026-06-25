@@ -27,21 +27,23 @@ Output schema (task_related.json)
 ----------------------------------
   {
     "instruction": str,
-    "task_related_instances": [{object_index, label, role, confidence}],  # union-eligible
-    "excluded_instances":     [{object_index, label, role, confidence}],  # distractor/robot/...
-    "missing_or_uncertain":   [{object_index, label, role, confidence}],  # uncertain or not returned
-    "label_source": str,   # e.g. "qwen_text:qwen3-vl-flash"
-    "label_version": str,  # prompt schema version
+    "task_related_instances": [{object_index, label, role, confidence, reason}],
+    "missing_or_uncertain": [{object_index, label, reason}],
+    "valid_for_action_seg": bool,   # true iff >=1 task-related object selected
+    "label_source": "qwen_text_only",
+    "label_version": "v1",
   }
 
-Roles
+Roles (all union-eligible; only these survive in task_related_instances)
 -----
-ALLOWED_ROLES below. Union-eligible (-> task_related_instances):
   manipulated_object, target_object, target_container,
   source_object, source_support_object
-  (+ support_object only when --include-support-object is passed)
-Excluded (-> excluded_instances): distractor, robot, support_object (by default)
-Uncertain / not-returned (-> missing_or_uncertain): uncertain
+
+Robot parts are handled separately by robot_label_registry.yaml and are NOT
+selected here. Distractors / background / uncertain objects are simply omitted by
+the model (or listed under missing_or_uncertain). The objects list is shown to the
+model in full and NEVER reindexed, so object_index always equals the SAM3 mask
+instance index.
 
 Resumability & IO discipline
 ----------------------------
@@ -69,54 +71,69 @@ import httpx
 
 DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 DEFAULT_MODEL = "qwen3-vl-flash"
-LABEL_VERSION = "task-related-v1"
+LABEL_VERSION = "v1"
+LABEL_SOURCE = "qwen_text_only"
 OUTPUT_NAME = "task_related.json"
 
+# Only the union-eligible roles exist now. Robot parts are handled separately by
+# robot_label_registry.yaml; distractors / background / uncertain are simply not
+# selected (the model omits them, or lists them under missing_or_uncertain).
 ALLOWED_ROLES = (
     "manipulated_object",
     "target_object",
     "target_container",
     "source_object",
     "source_support_object",
-    "support_object",
-    "distractor",
-    "robot",
-    "uncertain",
 )
-# Roles that go into the training union mask.
-UNION_ROLES_BASE = frozenset({
-    "manipulated_object",
-    "target_object",
-    "target_container",
-    "source_object",
-    "source_support_object",
-})
-UNCERTAIN_ROLES = frozenset({"uncertain"})
 
+# Prompt is a single self-contained user message. Two placeholders are filled by
+# str.replace (NOT str.format — the body contains literal JSON braces).
+PROMPT_TEMPLATE = """You are labeling task-related objects for robot manipulation.
 
-SYSTEM_PROMPT = (
-    "You are labeling task-related objects for a robot manipulation dataset.\n"
-    "You are given a natural-language instruction and a fixed, indexed list of "
-    "objects detected in the scene.\n"
-    "Select which objects are related to completing the instruction.\n"
-    "Rules:\n"
-    "- Only select objects from the provided list. Do not invent new objects.\n"
-    "- Refer to each object by its given integer index; echo its label verbatim.\n"
-    "- If the instruction is empty or unrelated to any listed object, return an "
-    "empty list.\n"
-    "- Assign each selected object exactly one role from: "
-    + ", ".join(ALLOWED_ROLES)
-    + ".\n"
-    "Role guidance: manipulated_object = the thing the gripper grasps/moves; "
-    "target_object/target_container = where it goes; source_object/"
-    "source_support_object = where it comes from; support_object = a passive "
-    "surface (table/shelf) that is mentioned but not acted on; distractor = "
-    "present but irrelevant to the instruction; robot = the robot/arm/gripper "
-    "itself; uncertain = relevant but you cannot confidently assign a role.\n"
-    'Return strict JSON only, no prose, of the form: '
-    '{"task_related_instances": [{"object_index": <int>, "label": "<verbatim>", '
-    '"role": "<role>", "confidence": <0..1>}]}'
-)
+Given an action instruction and an indexed object list, select only the objects that are directly needed to complete the instruction.
+
+The object index is the position shown in the indexed object list. Only choose from the provided indices. Do not invent objects.
+
+Instruction:
+__INSTRUCTION__
+
+Objects:
+__INDEXED_OBJECTS__
+
+Return strict JSON only:
+
+{
+  "instruction": "...",
+  "task_related_instances": [
+    {
+      "object_index": 0,
+      "label": "...",
+      "role": "...",
+      "confidence": 0.0,
+      "reason": "..."
+    }
+  ],
+  "missing_or_uncertain": [],
+  "valid_for_action_seg": true,
+  "label_source": "qwen_text_only",
+  "label_version": "v1"
+}
+
+Allowed roles for task_related_instances:
+
+- manipulated_object: object directly moved, picked, placed, pushed, inserted, opened, closed, turned on/off, etc.
+- target_object: target object/surface/location for the action. For "put X on/under/beside Y", Y is target_object, even if Y is a shelf, cabinet, counter, tray, plate, or table.
+- target_container: container/appliance/holder/drawer/basket/box that receives or is used with the manipulated object.
+- source_object: object/location the manipulated object is removed from.
+- source_support_object: object supporting the manipulated object at the start, e.g. "bowl on the ramekin" -> ramekin.
+
+Do not select robot parts, distractors, uncertain objects, or generic background/support objects.
+
+Important:
+- A cabinet shelf in "put the pan under/on the cabinet shelf" is target_object, not background support.
+- A table/counter/shelf is selected only if explicitly used as source or target.
+- If the instruction is empty or no action-related object can be selected, return an empty task_related_instances list and set valid_for_action_seg=false.
+- The label must exactly match the object label from the provided indexed list."""
 
 
 # ----------------------------------------------------------------- enumerate
@@ -220,18 +237,12 @@ def call_qwen(instruction: str, objects: list[str], model: str, api_key: str,
     passes the HTTP proxy explicitly (see --proxy / its env default).
     """
     indexed = "\n".join(f"{i}: {lbl}" for i, lbl in enumerate(objects))
-    user_msg = (
-        f"Instruction:\n{instruction}\n\n"
-        f"Objects (index: label):\n{indexed}\n\n"
-        "Select which objects are related to completing the instruction and "
-        "assign each a role. Return strict JSON only."
-    )
+    prompt = (PROMPT_TEMPLATE
+              .replace("__INSTRUCTION__", instruction)
+              .replace("__INDEXED_OBJECTS__", indexed))
     body = {
         "model": model,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "response_format": {"type": "json_object"},
     }
@@ -254,22 +265,26 @@ def call_qwen(instruction: str, objects: list[str], model: str, api_key: str,
     raise RuntimeError(f"Qwen call failed after {max_retries} attempts: {last_err}")
 
 
-def partition_result(parsed: dict, objects: list[str],
-                     union_roles: frozenset[str]) -> dict:
-    """Map a Qwen response onto the three output buckets, validated against objects.
+def partition_result(parsed: dict, objects: list[str]) -> dict:
+    """Validate a Qwen response against the on-disk objects list.
 
-    - object_index must be a valid index into `objects`; out-of-range entries are
-      dropped (object stays in missing_or_uncertain).
+    - object_index must be a valid index into `objects`; out-of-range or
+      bad-role entries are demoted into missing_or_uncertain instead of silently
+      dropped, so the object is still accounted for.
     - label is overwritten with objects[object_index] (the canonical, on-disk
-      label) so it always matches the mask the loader will select.
-    - role not in ALLOWED_ROLES is coerced to "uncertain".
-    - Objects never returned by Qwen fall into missing_or_uncertain.
+      label) so it always matches the mask the loader will select by index.
+    - Only the 5 allowed roles survive in task_related_instances.
+    - valid_for_action_seg is derived from the *validated* list (not trusted from
+      the model) so it can never disagree with task_related_instances.
     """
     rows = parsed.get("task_related_instances")
     if not isinstance(rows, list):
         rows = []
 
-    by_index: dict[int, dict] = {}
+    task_related: list[dict] = []
+    missing: list[dict] = []
+    seen: set[int] = set()
+
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -277,44 +292,47 @@ def partition_result(parsed: dict, objects: list[str],
             idx = int(r.get("object_index"))
         except (TypeError, ValueError):
             continue
-        if idx < 0 or idx >= len(objects):
+        if idx < 0 or idx >= len(objects) or idx in seen:
             continue
-        if idx in by_index:  # keep first mention, ignore duplicates
-            continue
-        role = r.get("role")
-        if role not in ALLOWED_ROLES:
-            role = "uncertain"
+        seen.add(idx)
         try:
             conf = float(r.get("confidence", 0.0))
         except (TypeError, ValueError):
             conf = 0.0
         conf = min(1.0, max(0.0, conf))
-        by_index[idx] = {
+        reason = str(r.get("reason", ""))
+        role = r.get("role")
+        ent = {
             "object_index": idx,
             "label": objects[idx],  # canonical label from disk, not Qwen's echo
-            "role": role,
+            "role": role if role in ALLOWED_ROLES else "uncertain",
             "confidence": round(conf, 3),
+            "reason": reason,
         }
+        (task_related if role in ALLOWED_ROLES else missing).append(ent)
 
-    task_related, excluded, missing = [], [], []
-    for idx in range(len(objects)):
-        ent = by_index.get(idx)
-        if ent is None:
-            missing.append({
-                "object_index": idx, "label": objects[idx],
-                "role": "uncertain", "confidence": 0.0,
-            })
+    # Pass through the model's own missing_or_uncertain, sanitized to valid,
+    # not-already-selected indices.
+    for r in parsed.get("missing_or_uncertain") or []:
+        if not isinstance(r, dict):
             continue
-        if ent["role"] in union_roles:
-            task_related.append(ent)
-        elif ent["role"] in UNCERTAIN_ROLES:
-            missing.append(ent)
-        else:
-            excluded.append(ent)
+        try:
+            idx = int(r.get("object_index"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(objects) or idx in seen:
+            continue
+        seen.add(idx)
+        missing.append({
+            "object_index": idx,
+            "label": objects[idx],
+            "reason": str(r.get("reason", "")),
+        })
+
     return {
         "task_related_instances": task_related,
-        "excluded_instances": excluded,
         "missing_or_uncertain": missing,
+        "valid_for_action_seg": len(task_related) > 0,
     }
 
 
@@ -327,8 +345,8 @@ def _wait_one(in_flight: set):
 
 
 def process_episode(meta_path: Path, *, model: str, api_key: str,
-                    union_roles: frozenset[str], timeout: float,
-                    max_retries: int, force: bool, proxy: str | None = None) -> str:
+                    timeout: float, max_retries: int, force: bool,
+                    proxy: str | None = None) -> str:
     """Process one episode. Returns a short status string for logging."""
     out_path = meta_path.with_name(OUTPUT_NAME)
     if out_path.exists() and not force:
@@ -343,14 +361,13 @@ def process_episode(meta_path: Path, *, model: str, api_key: str,
     if not instruction:
         return "skip_no_instruction"
 
-    label_source = f"qwen_text:{model}"
     if not objects:
         atomic_write_json(out_path, {
             "instruction": instruction,
             "task_related_instances": [],
-            "excluded_instances": [],
             "missing_or_uncertain": [],
-            "label_source": label_source,
+            "valid_for_action_seg": False,
+            "label_source": LABEL_SOURCE,
             "label_version": LABEL_VERSION,
         })
         return "ok_no_objects"
@@ -361,11 +378,11 @@ def process_episode(meta_path: Path, *, model: str, api_key: str,
     except Exception as e:  # noqa: BLE001
         return f"err_qwen:{e}"
 
-    buckets = partition_result(parsed, objects, union_roles)
+    buckets = partition_result(parsed, objects)
     payload = {
         "instruction": instruction,
         **buckets,
-        "label_source": label_source,
+        "label_source": LABEL_SOURCE,
         "label_version": LABEL_VERSION,
     }
     atomic_write_json(out_path, payload)
@@ -389,8 +406,6 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Explicit HTTP proxy for the Qwen API. Defaults to "
                         "HTTPS_PROXY/HTTP_PROXY env (the cluster's SOCKS ALL_PROXY "
                         "is intentionally ignored).")
-    p.add_argument("--include-support-object", action="store_true",
-                   help="Put support_object into the training union (default: excluded).")
     p.add_argument("--datasets", nargs="*", default=None,
                    help="Optional dataset-name filter (first path component).")
     p.add_argument("--limit", type=int, default=0,
@@ -408,10 +423,6 @@ def main() -> int:
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key and not args.dry_run:
         raise SystemExit("DASHSCOPE_API_KEY not set in environment")
-
-    union_roles = UNION_ROLES_BASE
-    if args.include_support_object:
-        union_roles = union_roles | {"support_object"}
 
     proxy = args.proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
     if proxy and not args.dry_run:
@@ -456,7 +467,7 @@ def main() -> int:
             if args.limit and submitted >= args.limit:
                 break
         print(f"[task-related] dry-run: {submitted} episodes would be processed "
-              f"(union_roles={sorted(union_roles)})", flush=True)
+              f"(roles={list(ALLOWED_ROLES)})", flush=True)
         return 0
 
     def submit_iter() -> Iterator[Path]:
@@ -481,8 +492,8 @@ def main() -> int:
             return None
         return ex.submit(
             process_episode, path, model=args.model, api_key=api_key,
-            union_roles=union_roles, timeout=args.timeout,
-            max_retries=args.max_retries, force=args.force, proxy=proxy,
+            timeout=args.timeout, max_retries=args.max_retries,
+            force=args.force, proxy=proxy,
         )
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
