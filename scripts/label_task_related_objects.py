@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -101,6 +102,46 @@ ALLOWED_ROLES = (
 # (e.g. "put X on the table") is kept.
 DEFAULT_LARGE_SUPPORT_LABELS = ("table", "counter", "floor", "wall", "background")
 LARGE_SUPPORT_ROLES = frozenset({"source_support_object"})
+
+# Robot parts are handled separately by the loader via robot_label_registry.yaml.
+# Qwen still occasionally selects "robotic arm" as manipulated_object (~2.6% of
+# episodes in audit), which would double-union the robot mask. We cross-check every
+# selected label against the same registry and demote any robot match.
+DEFAULT_ROBOT_REGISTRY = "reports/oxe_robot_labels/robot_label_registry.yaml"
+ROBOT_CATEGORIES = frozenset({"robotic_arm", "gripper", "end_effector"})
+
+
+def normalize_robot_label(label: object) -> str:
+    """Match hypolicy-target RobotLabelRegistry.normalize so lookups agree."""
+    text = str(label).casefold().strip()
+    text = re.sub(r"[_\-]+", " ", text)
+    text = re.sub(r"[^\w\s]+", " ", text)
+    return " ".join(text.split())
+
+
+def load_robot_label_set(path: Path) -> frozenset[str]:
+    """Load the set of normalized robot labels from robot_label_registry.yaml."""
+    import yaml  # local import: only needed when robot filtering is enabled
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    out: set[str] = set()
+
+    def _add(label: object) -> None:
+        n = normalize_robot_label(label)
+        if len(n) > 1:
+            out.add(n)
+
+    for cat, labels in (data.get("categories") or {}).items():
+        if cat in ROBOT_CATEGORIES:
+            for lbl in labels or []:
+                _add(lbl)
+    for label, meta in (data.get("labels") or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        if meta.get("category") in ROBOT_CATEGORIES and meta.get("is_robot_related", True):
+            _add(label)
+            for variant in meta.get("raw_variants") or []:
+                _add(variant)
+    return frozenset(out)
 
 # Prompt is a single self-contained user message. Two placeholders are filled by
 # str.replace (NOT str.format — the body contains literal JSON braces).
@@ -294,7 +335,8 @@ def is_large_support_label(label: str, large_support_labels: frozenset[str]) -> 
 def partition_result(parsed: dict, objects: list[str],
                      exclude_large_support: bool = True,
                      large_support_labels: frozenset[str] = frozenset(
-                         DEFAULT_LARGE_SUPPORT_LABELS)) -> dict:
+                         DEFAULT_LARGE_SUPPORT_LABELS),
+                     robot_labels: frozenset[str] | None = None) -> dict:
     """Validate a Qwen response against the on-disk objects list.
 
     - object_index must be a valid index into `objects`; out-of-range or
@@ -303,6 +345,10 @@ def partition_result(parsed: dict, objects: list[str],
     - label is overwritten with objects[object_index] (the canonical, on-disk
       label) so it always matches the mask the loader will select by index.
     - Only the 5 allowed roles survive in task_related_instances.
+    - When robot_labels is given, a selected label that resolves to a robot
+      category in robot_label_registry.yaml is demoted to missing_or_uncertain:
+      robot masks are unioned separately by the loader, so they must not appear
+      here (Qwen sometimes mislabels "robotic arm" as manipulated_object).
     - When exclude_large_support is set, a source_support_object whose label names
       a large support surface (table/counter/floor/wall/background) is demoted to
       missing_or_uncertain so it never enters the union mask. The demotion is
@@ -340,6 +386,14 @@ def partition_result(parsed: dict, objects: list[str],
             missing.append({
                 "object_index": idx, "label": objects[idx],
                 "reason": f"unrecognized role {role!r}; {reason}".strip("; "),
+            })
+            continue
+        if robot_labels and normalize_robot_label(objects[idx]) in robot_labels:
+            missing.append({
+                "object_index": idx, "label": objects[idx],
+                "reason": (f"demoted from {role}: robot label handled by "
+                           f"robot_label_registry, excluded from union; {reason}"
+                           ).strip("; "),
             })
             continue
         if (exclude_large_support and role in LARGE_SUPPORT_ROLES
@@ -396,7 +450,8 @@ def process_episode(meta_path: Path, *, model: str, api_key: str,
                     proxy: str | None = None,
                     exclude_large_support: bool = True,
                     large_support_labels: frozenset[str] = frozenset(
-                        DEFAULT_LARGE_SUPPORT_LABELS)) -> str:
+                        DEFAULT_LARGE_SUPPORT_LABELS),
+                    robot_labels: frozenset[str] | None = None) -> str:
     """Process one episode. Returns a short status string for logging."""
     out_path = meta_path.with_name(OUTPUT_NAME)
     if out_path.exists() and not force:
@@ -430,7 +485,8 @@ def process_episode(meta_path: Path, *, model: str, api_key: str,
 
     buckets = partition_result(parsed, objects,
                                exclude_large_support=exclude_large_support,
-                               large_support_labels=large_support_labels)
+                               large_support_labels=large_support_labels,
+                               robot_labels=robot_labels)
     payload = {
         "instruction": instruction,
         **buckets,
@@ -466,6 +522,10 @@ def build_argparser() -> argparse.ArgumentParser:
                         "On by default; use --no-exclude-large-support-objects to keep them.")
     p.add_argument("--large-support-labels", nargs="*", default=list(DEFAULT_LARGE_SUPPORT_LABELS),
                    help="Substring keywords (lowercased) treated as large support surfaces.")
+    p.add_argument("--robot-label-registry", default=DEFAULT_ROBOT_REGISTRY,
+                   help="robot_label_registry.yaml used to drop robot labels that Qwen "
+                        "wrongly selects (handled separately by the loader). Set to '' to "
+                        "disable. Missing file -> robot filtering off with a warning.")
     p.add_argument("--datasets", nargs="*", default=None,
                    help="Optional dataset-name filter (first path component).")
     p.add_argument("--limit", type=int, default=0,
@@ -492,6 +552,18 @@ def main() -> int:
     if args.exclude_large_support_objects and not args.dry_run:
         print(f"[task-related] excluding large support surfaces from union: "
               f"{sorted(large_support)}", flush=True)
+
+    robot_labels: frozenset[str] | None = None
+    if args.robot_label_registry:
+        reg_path = Path(args.robot_label_registry)
+        if reg_path.is_file():
+            robot_labels = load_robot_label_set(reg_path)
+            if not args.dry_run:
+                print(f"[task-related] robot-label filter ON: {len(robot_labels)} "
+                      f"normalized robot labels from {reg_path}", flush=True)
+        elif not args.dry_run:
+            print(f"[task-related] WARNING: robot registry {reg_path} not found; "
+                  f"robot-label filtering OFF", flush=True)
 
     if args.metadata_root is not None:
         root = args.metadata_root
@@ -561,6 +633,7 @@ def main() -> int:
             force=args.force, proxy=proxy,
             exclude_large_support=args.exclude_large_support_objects,
             large_support_labels=large_support,
+            robot_labels=robot_labels,
         )
 
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
